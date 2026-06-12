@@ -1,0 +1,64 @@
+# Avalon — world data. Settlements, cargoes, and the tone lint's banned list.
+
+banned_phrases = [
+  "delve", "tapestry", "testament to", "I daresay", "I warrant",
+  "vibrant", "bustling", "nestled", "—and yet—",
+]
+
+[[settlements]]
+id = "draycote"
+name = "Draycote"
+legs = 3
+pay_bonus_pct = 0
+flavor = "A grain town with a weighbridge and opinions about strangers."
+
+[[settlements]]
+id = "millhaven"
+name = "Millhaven"
+legs = 3
+pay_bonus_pct = 5
+flavor = "Mill country. Everything smells of flour and diesel."
+
+[[settlements]]
+id = "stane_end"
+name = "Stane End"
+legs = 4
+pay_bonus_pct = 15
+flavor = "End of the metalled road. After Stane End there is only mud and rumour."
+
+[[settlements]]
+id = "ferrier_bridge"
+name = "Ferrier Bridge"
+legs = 5
+pay_bonus_pct = 30
+flavor = "The river crossing. Carver's lot tax one bank; the Collective stamp the other."
+
+[[cargoes]]
+name = "unlicensed barley"
+qty_desc = "forty sacks"
+base_pay_pence = 1400
+illicit = true
+
+[[cargoes]]
+name = "crated medicine"
+qty_desc = "a dozen crates"
+base_pay_pence = 1100
+illicit = false
+
+[[cargoes]]
+name = "'unspecified transit assets'"
+qty_desc = "six sealed pallets"
+base_pay_pence = 1900
+illicit = true
+
+[[cargoes]]
+name = "tinned beef"
+qty_desc = "two hundred tins"
+base_pay_pence = 900
+illicit = false
+
+[[cargoes]]
+name = "drummed paraffin"
+qty_desc = "eight drums"
+base_pay_pence = 1250
+illicit = false

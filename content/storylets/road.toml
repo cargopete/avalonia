@@ -1,0 +1,88 @@
+# Breakdown and road-hazard templates — the Bedford and the weather have opinions.
+
+[[storylet]]
+id = "breakdown_belt"
+template = "breakdown"
+weight = 2
+requires = { max_wear = 6 }
+title = "The Long Climb"
+body = [
+  "Half a mile up the climb out of the valley, the Bedford develops an opinion: a thin scream from under the bonnet that rises with the revs. Fan belt. The verge is wide enough, and the light won't last.",
+]
+
+[[storylet.choices]]
+label = "Do it properly"
+test = { skill = "spanners", dc = 7, dc_wear_div = 3 }
+effects = { ticks = 1 }
+outcome = "Twenty minutes, two skinned knuckles, and the spare belt seats true. The scream stops. The silence is worth the daylight it cost."
+fail_outcome = "The spare belt is the wrong belt — of course it is. A passing carter sells you the right one at a price that suggests he knows exactly what it's worth on this hill (15s)."
+fail_effects = { cash = -180, ticks = 1 }
+
+[[storylet.choices]]
+label = "Bodge it with a stocking and press on"
+effects = { wear = 2, flag = "bodged_belt" }
+outcome = "A stocking, two cable ties, and a promise. The scream drops to a mutter. The Bedford and you both know this conversation isn't over."
+
+[[storylet]]
+id = "breakdown_serious"
+template = "breakdown"
+weight = 2
+requires = { min_wear = 5 }
+title = "The Reckoning"
+body = [
+  "It is not a noise this time. It is a smell — hot metal and burnt rubber, the Bedford's whole vocabulary of grievance at once. She rolls to a stop on the flat, which is her one act of mercy today. The bodges and the miles have come due.",
+]
+
+[[storylet.choices]]
+label = "Strip it down and do the lot"
+test = { skill = "spanners", dc = 9 }
+effects = { ticks = 2, wear = -3 }
+outcome = "Three hours in the road dirt, and at the end of it the Bedford turns over sweet as a sewing machine. You have bought back her good opinion, at the price of the whole afternoon."
+fail_outcome = "Two hours in, you find the part you cannot make: a gasket gone to lace. A drayman tows you the last stretch for 40s and does not stop talking once."
+fail_effects = { cash = -480, ticks = 2, wear = -1 }
+
+[[storylet.choices]]
+label = "Nurse her in at walking pace"
+effects = { ticks = 2, wear = 1, fuel_ml = -1500 }
+outcome = "You bring her in like a wounded animal, at a pace that lets pedestrians overtake. Every farm you pass comes out to watch. The story will arrive before you do."
+
+[[storylet]]
+id = "weather_flood"
+template = "hazard"
+weight = 2
+title = "The Ford at Lower Soley"
+body = [
+  "The week's rain has made its decision: the ford at Lower Soley is a river again, brown and businesslike, with a depth-post showing two feet and a lie. A farm track loops east — an hour, maybe more, of mud and gates.",
+]
+
+[[storylet.choices]]
+label = "Take the ford"
+test = { skill = "spanners", dc = 8, dc_wear_div = 4 }
+outcome = "You take it slow and steady, exhaust burbling like a kettle drowning, and the Bedford walks out the far side streaming like a retriever. Somewhere behind you a heron applauds by leaving."
+fail_outcome = "Halfway across, the water finds the distributor. Twenty minutes drying caps on a dry sack while the river goes through your floorboards like a customs officer."
+fail_effects = { ticks = 1, wear = 1 }
+
+[[storylet.choices]]
+label = "Loop east by the farm track"
+effects = { ticks = 1, fuel_ml = -2000 }
+outcome = "Eleven gates. You open all of them, and close all of them, because the one you don't close will be the one with the bull. The track delivers you muddy, late, and undrowned."
+
+[[storylet]]
+id = "hazard_sheep"
+template = "hazard"
+weight = 1
+title = "An Administrative Flock"
+body = [
+  "Around the blind bend: sheep. Not a few sheep — a parliamentary quorum of sheep, in session across both verges, chaired by a dog with strong views and a shepherd with none. The session shows no sign of rising.",
+]
+
+[[storylet.choices]]
+label = "Inch through with diplomatic use of the horn"
+effects = { ticks = 1 }
+outcome = "The flock adjourns around the Bedford at the pace of a procedure being followed. The dog files an objection at your offside tyre. The shepherd raises his pipe a quarter inch, which out here is a formal apology."
+
+[[storylet.choices]]
+label = "Buy your way through with a quiet word"
+requires_cash = 60
+effects = { cash = -60, flag = "friend_of_shepherds" }
+outcome = "Five shillings changes hands and the dog receives an instruction in a language older than forms. The road opens like the sea. 'You're the barley fellow,' the shepherd says — a fact you have never told him."

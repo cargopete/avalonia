@@ -1,0 +1,11 @@
+[package]
+name = "avalon-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+avalon-content = { path = "../avalon-content" }
+serde_json = { workspace = true }
+rand = "0.8"
+rand_chacha = { version = "0.3", features = ["serde1"] }

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/avalon-sim",
+    "crates/avalon-content",
+    "crates/avalon-orchestrator",
+    "crates/avalond",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

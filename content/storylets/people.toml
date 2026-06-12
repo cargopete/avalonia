@@ -1,0 +1,114 @@
+# People on the road — travellers, rivals, Carver's lot, and opportunity.
+
+[[storylet]]
+id = "traveller_merchant"
+template = "traveller"
+weight = 2
+title = "A Figure on the Verge"
+body = [
+  "A man stands beside a dead motorcycle with the particular stillness of someone who has waved at traffic long enough to stop believing in it. Dusk is coming down. {dest} is twenty minutes off.",
+]
+
+[[storylet.choices]]
+label = "Stop and help"
+effects = { ticks = 1, fuel_ml = -1000, cash = 60, flag = "helped_traveller" }
+outcome = "The trouble is a fouled plug; you have it running inside ten minutes. He introduces himself as a seed merchant, which may even be true, presses 5s on you against your protest, and says he'll remember the truck. Out here, being remembered is a currency with two sides."
+
+[[storylet.choices]]
+label = "Drive past"
+effects = { flag = "passed_traveller" }
+outcome = "You hold your line and your schedule. In the mirror he doesn't wave. Somewhere a ledger you'll never read records the lights that didn't stop."
+
+[[storylet]]
+id = "traveller_setup"
+template = "traveller"
+weight = 2
+requires = { min_suspicion = 3, illicit = true }
+title = "A Convenient Breakdown"
+body = [
+  "A car angled across half the road, bonnet up, and a man beside it whose coat is too clean for a man who has been wrestling an engine. He waves with both arms. The hedge behind him is the kind of hedge that could hold three more men, and the light is going.",
+]
+
+[[storylet.choices]]
+label = "Stop, but keep her in gear"
+test = { skill = "charm", dc = 9 }
+outcome = "You stop a truck-length short and let the engine idle its question. Close up, his eyes do the arithmetic — the gear lever, your hand on it, the distance. 'Trouble's fixed itself,' he decides. As you pull away, the hedge rearranges itself."
+fail_outcome = "You stop a length short, but talk too long. By the end there are three of them and the arithmetic is theirs: a 'toll' of 30s for the use of a public road. Their receipt is not stopping you again."
+fail_effects = { cash = -360, flag = "shaken_down" }
+
+[[storylet.choices]]
+label = "Straight past, foot down"
+effects = { wear = 1, fuel_ml = -1500, flag = "ran_ambush" }
+outcome = "You take the grass verge at speed. Behind you the clean-coated man performs surprise badly, like an actor who has rehearsed a different scene. Word of an undutiful truck will get about."
+
+[[storylet]]
+id = "rival_smuggler"
+template = "rival"
+weight = 2
+requires = { illicit = true }
+title = "The Other Truck"
+body = [
+  "A Leyland comes up fast in your mirror and sits there, two lengths back, in the way that means something. At the long straight it pulls level. The driver — younger than you, scarf, cigarette — looks across at your sheeting, then holds up four fingers. Pulver's boy. Four means: this is our run, find another.",
+]
+
+[[storylet.choices]]
+label = "Hold your line and your nerve"
+test = { skill = "charm", dc = 8 }
+outcome = "You look back at him the way Arthur looks at a docket that doesn't add up. The four fingers become a shrug; the Leyland drops back. There is an order to these things, and today you outrank a scarf."
+fail_outcome = "He flicks the cigarette at your windscreen and cuts in hard enough to put your nearside in the ditch grass. By the time the wheel stops fighting you, the Leyland is a smell of exhaust. Word will go round that Cobb gave way."
+fail_effects = { wear = 1, suspicion = 1, flag = "yielded_to_pulver" }
+
+[[storylet.choices]]
+label = "Wave him on, all courtesy"
+effects = { flag = "yielded_to_pulver" }
+outcome = "You lift two fingers off the wheel — after you, sir — and let him take his precious road. Cheap at the price, unless the price compounds. Pulver's lot keep accounts."
+
+[[storylet]]
+id = "carver_toll"
+template = "shakedown"
+weight = 2
+requires = { min_runs = 1 }
+title = "Carver's Hospitality"
+body = [
+  "Two drums of diesel stood in the road make a gate, and the gate is manned by men in good boots. One consults a notebook. 'Cobb,' he says, pleased, like a man finding his name in a hymnal. 'Mr. Carver maintains this road.' The road has not been maintained since the Coronation.",
+]
+
+[[storylet.choices]]
+label = "Pay the 'maintenance' (15s)"
+requires_cash = 180
+effects = { cash = -180, flag = "paid_carver", faction = "carver", faction_delta = 1 }
+outcome = "The notebook receives a tick. 'Mr. Carver says a regular arrangement could be had.' The drums roll aside. As tolls go it was almost civil, which is somehow the worrying part."
+
+[[storylet.choices]]
+label = "Refuse, with references to the actual law"
+test = { skill = "charm", dc = 10 }
+effects = { faction = "carver", faction_delta = -1, flag = "refused_carver" }
+outcome = "You cite the highways acts to men holding pick handles, and something in the sheer nerve of it lands. The notebook man laughs, once. 'He'll like you,' he says, ominously, and waves you past free."
+fail_outcome = "The notebook man stops smiling. The toll is now 30s, 'arrears included,' and the man at the second drum has stopped pretending not to hold a pick handle."
+fail_effects = { cash = -360, faction = "carver", faction_delta = -1, flag = "refused_carver" }
+
+[[storylet]]
+id = "opportunity_salvage"
+template = "opportunity"
+weight = 1
+title = "The Overturned Cart"
+body = [
+  "A hay cart on its side in the ditch, one wheel still turning, contents fanned across the verge — and among the hay, unmistakable, the dull gleam of tinned goods. Of the carter there is no sign. Of other traffic, likewise.",
+]
+
+[[storylet.choices]]
+label = "Load what fits"
+effects = { cash = 240, suspicion = 1, flag = "took_salvage" }
+outcome = "Forty tins ride home under your sheeting. Salvage, you tell yourself, has a long and respectable maritime tradition, and a ditch is practically the sea. The tins do not argue. Somewhere, eventually, a carter will."
+
+[[storylet.choices]]
+label = "Right the cart and leave the tins"
+test = { skill = "spanners", dc = 6 }
+effects = { flag = "righted_cart" }
+outcome = "The cart comes up with a groan and most of a load. You stack the strays, wedge the wheel, and leave it as found, more or less. It is the kind of deed nobody sees, which is either its definition or its flaw."
+fail_outcome = "The cart is heavier than your principles. It settles back into the ditch with a sigh, taking a fresh spoke with it. You stack the tins where the carter will find them and hope he counts charitably."
+fail_effects = { ticks = 1 }
+
+[[storylet.choices]]
+label = "Not your cart, not your ditch"
+outcome = "You ease past on the far verge. The wheel turns and turns, like something keeping its own minutes. The road ahead stays empty and the road behind stays quiet, and that, today, is the whole of the news."

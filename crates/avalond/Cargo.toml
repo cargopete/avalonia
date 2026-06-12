@@ -1,0 +1,14 @@
+[package]
+name = "avalond"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+avalon-sim = { path = "../avalon-sim" }
+avalon-content = { path = "../avalon-content" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
