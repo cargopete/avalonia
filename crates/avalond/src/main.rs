@@ -1,6 +1,9 @@
 //! avalond — the local daemon: axum API, SSE, SQLite save, sessions, jobs
-//! (RFC-AVL-001 DR-1/DR-4/DR-5). Stage 1: the Run, served as scene + choices.
+//! (RFC-AVL-001 DR-1/DR-4/DR-5).
 
+mod llm;
+
+use avalon_orchestrator::{LlmConfig, Orchestrator};
 use avalon_sim::{scene, step, Command, ContentDb, Event, Scene, WorldState};
 use axum::extract::State;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -31,10 +34,22 @@ const MIGRATIONS: &[&str] = &[
          payload TEXT NOT NULL
      );
      CREATE INDEX idx_events_tick ON events(tick);",
+    // v2: idle-lane job queue + embedding cache (Stage 3/4)
+    "CREATE TABLE jobs(
+         id INTEGER PRIMARY KEY,
+         kind TEXT NOT NULL,
+         payload TEXT NOT NULL,
+         state TEXT NOT NULL DEFAULT 'queued',
+         attempts INTEGER NOT NULL DEFAULT 0,
+         created_at INTEGER DEFAULT (unixepoch())
+     );
+     CREATE INDEX idx_jobs_state ON jobs(state);
+     CREATE TABLE embeddings(memory_id INTEGER PRIMARY KEY, vec BLOB NOT NULL);",
 ];
 
-struct App {
+pub(crate) struct App {
     content: Arc<ContentDb>,
+    orch: Arc<Orchestrator>,
     world: Mutex<WorldState>,
     db: Mutex<Connection>,
     tx: broadcast::Sender<String>,
@@ -63,6 +78,12 @@ struct View {
 #[derive(Deserialize)]
 struct ChooseReq {
     idx: usize,
+}
+
+#[derive(Deserialize)]
+struct SayReq {
+    npc: String,
+    text: String,
 }
 
 impl StateView {
@@ -157,12 +178,14 @@ fn persist(conn: &Connection, world: &WorldState, events: &[Event]) -> rusqlite:
     Ok(())
 }
 
-fn apply(app: &App, cmd: Command) -> View {
+pub(crate) fn apply(app: &App, cmd: Command) -> View {
     let mut w = app.world.lock().unwrap();
+    let memory_watermark = w.next_memory_id;
     let (next, events) = step(&w, &cmd, &app.content);
     {
         let conn = app.db.lock().unwrap();
         persist(&conn, &next, &events).expect("persist failed");
+        llm::enqueue_for_new_memories(&conn, &next, memory_watermark);
     }
     for ev in &events {
         let _ = app.tx.send(serde_json::to_string(ev).unwrap());
@@ -178,6 +201,31 @@ async fn get_view(State(app): State<Arc<App>>) -> Json<View> {
 
 async fn choose(State(app): State<Arc<App>>, Json(req): Json<ChooseReq>) -> Json<View> {
     Json(apply(&app, Command::Choose { idx: req.idx }))
+}
+
+async fn say(
+    State(app): State<Arc<App>>,
+    Json(req): Json<SayReq>,
+) -> Json<serde_json::Value> {
+    let text = req.text.trim().to_string();
+    if text.is_empty() || text.len() > 400 {
+        return Json(serde_json::json!({ "line": "…", "fallback": true }));
+    }
+    let (line, fallback) = llm::npc_reply(&app, &req.npc, &text).await;
+    Json(serde_json::json!({ "npc": req.npc, "line": line, "fallback": fallback }))
+}
+
+async fn status(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let jobs: i64 = {
+        let conn = app.db.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM jobs WHERE state = 'queued'", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    Json(serde_json::json!({ "llm": app.orch.available().await, "queued_jobs": jobs }))
+}
+
+async fn debug_world(State(app): State<Arc<App>>) -> Json<WorldState> {
+    Json(app.world.lock().unwrap().clone())
 }
 
 async fn stream(
@@ -222,6 +270,12 @@ async fn main() {
     if away_days > 0 {
         let (next, events) = step(&world, &Command::CatchUp { days: away_days }, &content);
         persist(&conn, &next, &events).expect("persist catch-up");
+        // The digest job rewrites the templated note in voice, later, idly.
+        if let Some(Event::Narration { text, .. }) =
+            events.iter().rev().find(|e| matches!(e, Event::Narration { .. }))
+        {
+            llm::enqueue(&conn, "digest", serde_json::json!({ "text": text }));
+        }
         world = next;
         println!("avalond: caught up {away_days} day(s) away");
     }
@@ -236,11 +290,32 @@ async fn main() {
     );
 
     let (tx, _) = broadcast::channel(256);
-    let app = Arc::new(App { content, world: Mutex::new(world), db: Mutex::new(conn), tx });
+    let orch = Arc::new(Orchestrator::new(LlmConfig {
+        banned_phrases: content.banned_phrases.clone(),
+        ..Default::default()
+    }));
+    let app = Arc::new(App {
+        content,
+        orch,
+        world: Mutex::new(world),
+        db: Mutex::new(conn),
+        tx,
+    });
+
+    // The idle lane: reflections, gossip rewording, embeddings, digests.
+    tokio::spawn(llm::idle_worker(app.clone()));
+    println!(
+        "avalond: llm at {} ({})",
+        app.orch.cfg.host,
+        if app.orch.available().await { "reachable" } else { "unreachable — fallbacks only" }
+    );
 
     let router = Router::new()
         .route("/api/view", get(get_view))
         .route("/api/choose", post(choose))
+        .route("/api/say", post(say))
+        .route("/api/status", get(status))
+        .route("/api/debug/world", get(debug_world))
         .route("/api/stream", get(stream))
         .with_state(app);
 

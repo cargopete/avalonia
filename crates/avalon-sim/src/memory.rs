@@ -70,7 +70,16 @@ pub fn chargeable(flag: &str) -> Option<&'static str> {
     })
 }
 
-fn memory_text(flag: &str, attrs: &FactAttrs, gossip: bool) -> String {
+fn settlement_display(content: &ContentDb, id: &str) -> String {
+    content
+        .settlements
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn memory_text(flag: &str, attrs: &FactAttrs, loc_name: &str, gossip: bool) -> String {
     let deed = match flag {
         "gate_smashed" => "took the barrier pole off its bracket at speed",
         "bribed_checkpoint" => "paid the 'paperwork fee' at the barrier",
@@ -88,9 +97,9 @@ fn memory_text(flag: &str, attrs: &FactAttrs, gossip: bool) -> String {
     };
     let actor = if attrs.actor == "cobb" { "Cobb" } else { &attrs.actor };
     if gossip {
-        format!("They say {actor} {deed}, out by {}.", attrs.location)
+        format!("They say {actor} {deed}, out by {loc_name}.")
     } else {
-        format!("{actor} {deed}, on the {} road.", attrs.location)
+        format!("{actor} {deed}, on the {loc_name} road.")
     }
 }
 
@@ -161,7 +170,7 @@ pub(crate) fn record_run_memories(w: &mut WorldState, run_flags: &BTreeSet<Strin
                 id: 0,
                 npc: witness.into(),
                 kind: "observation".into(),
-                text: memory_text(flag, &attrs, false),
+                text: memory_text(flag, &attrs, &settlement_display(content, &attrs.location), false),
                 fact_id: Some(fact_id.clone()),
                 asserts: Some(attrs.clone()),
                 importance,
@@ -188,7 +197,8 @@ pub(crate) fn record_run_memories(w: &mut WorldState, run_flags: &BTreeSet<Strin
                 1 => distorted.actor = "one of Pulver's drivers".into(),
                 _ => {} // faithful retelling — it happens
             }
-            let text = memory_text(flag, &distorted, true);
+            let text =
+                memory_text(flag, &distorted, &settlement_display(content, &distorted.location), true);
             add_memory(
                 w,
                 MemoryEntry {

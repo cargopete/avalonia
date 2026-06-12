@@ -34,7 +34,33 @@ function money(pence: number): string {
 export default function App() {
   const [view, setView] = createSignal<View | null>(null)
   const [log, setLog] = createSignal<string[]>([])
+  const [llmLive, setLlmLive] = createSignal<boolean | null>(null)
+  const [chat, setChat] = createSignal<string[]>([])
+  const [chatBusy, setChatBusy] = createSignal(false)
   let busy = false
+  let chatInput: HTMLInputElement | undefined
+
+  const sendChat = async (e: Event) => {
+    e.preventDefault()
+    const text = chatInput?.value.trim()
+    if (!text || chatBusy()) return
+    chatInput!.value = ''
+    setChat((c) => [...c, `You — ${text}`])
+    setChatBusy(true)
+    try {
+      const res = await fetch('/api/say', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ npc: 'arthur', text }),
+      })
+      const data = await res.json()
+      setChat((c) => [...c, `Arthur — ${data.line}${data.fallback ? ' *' : ''}`])
+    } catch {
+      setChat((c) => [...c, 'Arthur — (the depot telephone is down)'])
+    } finally {
+      setChatBusy(false)
+    }
+  }
 
   const refresh = async () => {
     const res = await fetch('/api/view')
@@ -71,12 +97,17 @@ export default function App() {
 
   onMount(() => {
     refresh()
+    fetch('/api/status')
+      .then((r) => r.json())
+      .then((s) => setLlmLive(!!s.llm))
+      .catch(() => setLlmLive(false))
     const es = new EventSource('/api/stream')
     es.onmessage = (msg) => {
       const line = describe(JSON.parse(msg.data))
       if (line) setLog((l) => [line, ...l].slice(0, 80))
     }
     const onKey = (e: KeyboardEvent) => {
+      if (document.activeElement === chatInput) return
       if (e.key >= '1' && e.key <= '9') {
         e.preventDefault()
         choose(Number(e.key) - 1)
@@ -101,7 +132,12 @@ export default function App() {
     <main>
       <header>
         <h1>AVALON</h1>
-        <p class="sub">Form 4B not required &mdash; yet.</p>
+        <p class="sub">
+          Form 4B not required &mdash; yet.
+          <span class={`oracle ${llmLive() ? 'live' : ''}`}>
+            {llmLive() === null ? '' : llmLive() ? ' · the oracle is in' : ' · the oracle is out'}
+          </span>
+        </p>
       </header>
       <Show when={view()} fallback={<p>Reaching the depot&hellip;</p>}>
         {(v) => (
@@ -157,6 +193,19 @@ export default function App() {
                 </For>
               </ol>
             </section>
+            <Show when={v().scene.title.startsWith('Wychford Depot')}>
+              <section class="chat">
+                <For each={chat()}>{(line) => <p>{line}</p>}</For>
+                <form onSubmit={sendChat}>
+                  <input
+                    ref={chatInput}
+                    placeholder={chatBusy() ? 'Arthur considers…' : 'Say something to Arthur…'}
+                    disabled={chatBusy()}
+                    maxlength="200"
+                  />
+                </form>
+              </section>
+            </Show>
             <p class="hint">
               <kbd>1</kbd>&ndash;<kbd>{v().scene.choices.length}</kbd> to choose
               <Show when={v().scene.choices.filter((c) => c.enabled).length === 1}>

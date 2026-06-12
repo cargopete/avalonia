@@ -145,3 +145,28 @@ kbd {
 .log p {
   margin: 0.3rem 0;
 }
+
+.oracle { color: var(--dim); }
+.oracle.live { color: var(--accent); }
+
+.chat {
+  border-top: 1px dashed var(--panel);
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+}
+
+.chat p {
+  margin: 0.3rem 0;
+  color: var(--ink);
+  font-style: italic;
+}
+
+.chat input {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--dim);
+  color: var(--ink);
+  font: inherit;
+  padding: 0.5rem 0.75rem;
+  margin-top: 0.5rem;
+}

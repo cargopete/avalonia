@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 avalon-sim = { path = "../avalon-sim" }
 avalon-content = { path = "../avalon-content" }
+avalon-orchestrator = { path = "../avalon-orchestrator" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.8"
