@@ -15,11 +15,14 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tower_http::services::{ServeDir, ServeFile};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
-const BIND: &str = "127.0.0.1:4747";
+fn bind_addr() -> String {
+    std::env::var("AVALON_BIND").unwrap_or_else(|_| "127.0.0.1:4747".into())
+}
 const DEFAULT_SEED: u64 = 0xC0BB;
 
 /// Schema migrations, applied in order; PRAGMA user_version tracks progress.
@@ -228,6 +231,36 @@ async fn debug_world(State(app): State<Arc<App>>) -> Json<WorldState> {
     Json(app.world.lock().unwrap().clone())
 }
 
+/// Basic Auth gate, active only when AVALON_TOKEN is set. User: cobb.
+async fn auth_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(token) = std::env::var("AVALON_TOKEN") else {
+        return next.run(req).await;
+    };
+    if token.is_empty() {
+        return next.run(req).await;
+    }
+    use base64::Engine;
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("cobb:{token}"))
+    );
+    let supplied = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if supplied == Some(expected.as_str()) {
+        return next.run(req).await;
+    }
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Basic realm=\"the corn exchange\"")
+        .body("Form 7C: credentials required, in duplicate.".into())
+        .unwrap()
+}
+
 async fn stream(
     State(app): State<Arc<App>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
@@ -310,6 +343,12 @@ async fn main() {
         if app.orch.available().await { "reachable" } else { "unreachable — fallbacks only" }
     );
 
+    // Serve the built SPA when web/dist exists (one port for everything);
+    // dev keeps using Vite on :5173 with its /api proxy.
+    let dist = PathBuf::from("web/dist");
+    let static_svc =
+        ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
+
     let router = Router::new()
         .route("/api/view", get(get_view))
         .route("/api/choose", post(choose))
@@ -317,9 +356,19 @@ async fn main() {
         .route("/api/status", get(status))
         .route("/api/debug/world", get(debug_world))
         .route("/api/stream", get(stream))
+        .fallback_service(static_svc)
+        .layer(axum::middleware::from_fn(auth_gate))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind(BIND).await.expect("bind");
-    println!("avalond: listening on http://{BIND}");
+    let bind = bind_addr();
+    let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
+    println!(
+        "avalond: listening on http://{bind} (auth: {})",
+        if std::env::var("AVALON_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) {
+            "on"
+        } else {
+            "off"
+        }
+    );
     axum::serve(listener, router).await.expect("serve");
 }
