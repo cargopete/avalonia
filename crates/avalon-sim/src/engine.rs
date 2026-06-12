@@ -501,6 +501,8 @@ fn foreshadow(flag: &str) -> Option<&'static str> {
 /// chalk up a fresh contract.
 fn next_day(w: &mut WorldState, content: &ContentDb, events: &mut Vec<Event>) {
     let run_flags = std::mem::take(&mut w.run.flags);
+    // Who saw what: facts, observations, gossip — before the run resets.
+    crate::memory::record_run_memories(w, &run_flags, content);
     w.flags.extend(run_flags);
 
     w.tick += 1;
@@ -528,6 +530,13 @@ fn next_day(w: &mut WorldState, content: &ContentDb, events: &mut Vec<Event>) {
         events,
         format!("Dawn over Wychford, day {}. New chalk on the board.", w.day()),
     );
+    if crate::inquiry::maybe_convene(w) {
+        narrate(
+            w,
+            events,
+            "There is something under the Bedford's wiper blade, and it is not a leaflet.",
+        );
+    }
 }
 
 fn drift_diesel(w: &mut WorldState, events: &mut Vec<Event>, lo: i64, hi: i64) {

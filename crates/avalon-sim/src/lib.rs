@@ -11,8 +11,12 @@
 //! canon only via recorded-oracle commands the daemon issues after validation.
 
 mod engine;
+pub mod inquiry;
+pub mod memory;
 
 pub use avalon_content::ContentDb;
+pub use inquiry::InquiryState;
+pub use memory::{FactAttrs, FactRec, MemoryEntry};
 
 use avalon_content::Storylet;
 use rand::{Rng, SeedableRng};
@@ -101,6 +105,13 @@ pub struct WorldState {
     pub runs_completed: u32,
     /// Persistent world flags (the facts database, embryonic).
     pub flags: BTreeSet<String>,
+    /// NPC memory canon: who knows what, and how they came to know it.
+    pub memories: Vec<MemoryEntry>,
+    /// Canonical facts — the Inquiry's ground truth.
+    pub facts: Vec<FactRec>,
+    pub next_memory_id: u64,
+    /// When Some, the corn exchange has Cobb and the scene routes there.
+    pub inquiry: Option<InquiryState>,
     /// Carried RNG: replaying the same seed + command log is bit-exact.
     pub rng: ChaCha8Rng,
     pub run: RunState,
@@ -125,6 +136,10 @@ impl WorldState {
             factions,
             runs_completed: 0,
             flags: BTreeSet::new(),
+            memories: Vec::new(),
+            facts: Vec::new(),
+            next_memory_id: 1,
+            inquiry: None,
             rng,
             run: RunState {
                 contract,
@@ -162,6 +177,12 @@ pub enum Command {
     Choose { idx: usize },
     /// Offline catch-up: `days` real days passed while nobody was driving.
     CatchUp { days: u64 },
+    /// Recorded oracle (daemon-issued, post-validation): an NPC's reflection.
+    AddReflection { npc: String, text: String, importance: i64 },
+    /// Recorded oracle: cosmetic rewording of an existing memory's text.
+    RewriteMemory { memory_id: u64, text: String },
+    /// Recorded oracle: residue of a town conversation with an NPC.
+    RecordChat { npc: String, summary: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -212,7 +233,11 @@ impl Choice {
 }
 
 pub fn scene(state: &WorldState, content: &ContentDb) -> Scene {
-    engine::scene(state, content)
+    if state.inquiry.is_some() {
+        inquiry::scene(state, content)
+    } else {
+        engine::scene(state, content)
+    }
 }
 
 /// The single pure transition. Everything canonical happens here.
@@ -224,10 +249,51 @@ pub fn step(state: &WorldState, cmd: &Command, content: &ContentDb) -> (WorldSta
             let current = scene(state, content);
             let valid = current.choices.get(*idx).map(|c| c.enabled).unwrap_or(false);
             if valid {
-                engine::choose(&mut next, *idx, content, &mut events);
+                if next.inquiry.is_some() {
+                    inquiry::choose(&mut next, *idx, content, &mut events);
+                } else {
+                    engine::choose(&mut next, *idx, content, &mut events);
+                }
             }
         }
         Command::CatchUp { days } => engine::catch_up(&mut next, *days, &mut events),
+        Command::AddReflection { npc, text, importance } => {
+            let tick = next.tick;
+            memory::add_memory(
+                &mut next,
+                MemoryEntry {
+                    id: 0,
+                    npc: npc.clone(),
+                    kind: "reflection".into(),
+                    text: text.clone(),
+                    fact_id: None,
+                    asserts: None,
+                    importance: (*importance).clamp(1, 10),
+                    tick,
+                },
+            );
+        }
+        Command::RewriteMemory { memory_id, text } => {
+            if let Some(m) = next.memories.iter_mut().find(|m| m.id == *memory_id) {
+                m.text = text.clone();
+            }
+        }
+        Command::RecordChat { npc, summary } => {
+            let tick = next.tick;
+            memory::add_memory(
+                &mut next,
+                MemoryEntry {
+                    id: 0,
+                    npc: npc.clone(),
+                    kind: "chat".into(),
+                    text: summary.clone(),
+                    fact_id: None,
+                    asserts: None,
+                    importance: 2,
+                    tick,
+                },
+            );
+        }
     }
     (next, events)
 }
@@ -382,6 +448,118 @@ mod tests {
             assert!((-5..=5).contains(v));
         }
         assert_eq!(w.runs_completed, 25);
+    }
+
+    /// Smash gates until officialdom convenes, then survive the Inquiry.
+    #[test]
+    fn an_inquiry_convenes_and_resolves() {
+        let c = content();
+        let mut w = WorldState::new(0xC0BB, &c);
+        let mut guard = 0;
+        // Policy: always pick the LAST enabled choice on the road (the
+        // troublemaker's option: through the pole, bodge it, drive past).
+        while w.inquiry.is_none() {
+            let s = scene(&w, &c);
+            let idx = if matches!(w.run.stage, RunStage::Town) && w.inquiry.is_none() {
+                if !w.run.accepted {
+                    2
+                } else if w.fuel_ml < 10_000 {
+                    1
+                } else {
+                    3
+                }
+            } else {
+                s.choices.iter().rposition(|ch| ch.enabled).unwrap()
+            };
+            let (next, _) = step(&w, &Command::Choose { idx }, &c);
+            w = next;
+            guard += 1;
+            assert!(guard < 600, "no inquiry after {guard} choices (susp {})", w.guild_suspicion);
+        }
+        assert!(!w.memories.is_empty(), "inquiry without memories");
+        assert!(!w.facts.is_empty(), "inquiry without facts");
+
+        // Question everyone, challenge everything, then take the verdict.
+        let mut steps = 0;
+        while w.inquiry.is_some() {
+            let s = scene(&w, &c);
+            let idx = s.choices.iter().position(|ch| ch.enabled).unwrap();
+            let (next, _) = step(&w, &Command::Choose { idx }, &c);
+            w = next;
+            steps += 1;
+            assert!(steps < 60, "inquiry did not resolve");
+        }
+        assert!(matches!(w.run.stage, RunStage::Town), "back to the depot after");
+    }
+
+    #[test]
+    fn oracle_commands_are_recorded_and_replayable() {
+        let c = content();
+        let w = WorldState::new(5, &c);
+        let cmd = Command::AddReflection {
+            npc: "arthur".into(),
+            text: "Cobb is late the way rain is wet.".into(),
+            importance: 7,
+        };
+        let (a, _) = step(&w, &cmd, &c);
+        let (b, _) = step(&w, &cmd, &c);
+        assert_eq!(world_hash(&a), world_hash(&b));
+        assert_eq!(a.memories.len(), 1);
+        let rewrite = Command::RewriteMemory {
+            memory_id: a.memories[0].id,
+            text: "Cobb's lateness is a force of nature.".into(),
+        };
+        let (a2, _) = step(&a, &rewrite, &c);
+        assert_eq!(a2.memories[0].text, "Cobb's lateness is a force of nature.");
+    }
+
+    #[test]
+    fn gossip_distortion_is_catchable() {
+        let c = content();
+        // Across seeds: at least one gossip memory whose asserts differ from
+        // the canonical fact — the contradiction the Inquiry exists to catch.
+        let mut found = false;
+        for seed in 0..30u64 {
+            let mut w = WorldState::new(seed, &c);
+            for _ in 0..6 {
+                w = {
+                    let mut w = w;
+                    for idx in [2usize, 1, 3] {
+                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
+                        w = next;
+                    }
+                    let mut guard = 0;
+                    while !matches!(w.run.stage, RunStage::Town) && w.inquiry.is_none() {
+                        let s = scene(&w, &c);
+                        let idx = s.choices.iter().rposition(|ch| ch.enabled).unwrap();
+                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
+                        w = next;
+                        guard += 1;
+                        if guard > 100 {
+                            break;
+                        }
+                    }
+                    while w.inquiry.is_some() {
+                        let s = scene(&w, &c);
+                        let idx = s.choices.iter().position(|ch| ch.enabled).unwrap();
+                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
+                        w = next;
+                    }
+                    w
+                };
+            }
+            for m in w.memories.iter().filter(|m| m.kind == "gossip") {
+                let Some(fid) = &m.fact_id else { continue };
+                let Some(f) = w.facts.iter().find(|f| &f.fact_id == fid) else { continue };
+                if m.asserts.as_ref() != Some(&f.attrs) {
+                    found = true;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found, "no distorted gossip in 30 seeds — distortion broken");
     }
 
     #[test]
