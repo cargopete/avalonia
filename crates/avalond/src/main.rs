@@ -218,7 +218,7 @@ async fn say(
 async fn status(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     let jobs: i64 = {
         let conn = app.db.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM jobs WHERE state = 'queued'", [], |r| r.get(0))
+        conn.query_row("SELECT COUNT(*) FROM jobs WHERE state = 'queued' AND attempts < 2", [], |r| r.get(0))
             .unwrap_or(0)
     };
     Json(serde_json::json!({ "llm": app.orch.available().await, "queued_jobs": jobs }))
