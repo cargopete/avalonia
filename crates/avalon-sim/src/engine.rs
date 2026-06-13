@@ -1,427 +1,477 @@
-//! The storylet engine: gates, deck draw, tests, effects, and the run
-//! framing (town, arrival, ledger close). Operates on WorldState; all prose
-//! comes from the ContentDb or the framing templates here.
+//! The mission engine: generation, gates, lazy beat draw, skill tests,
+//! effects, and the win/loss flow. All prose comes from the ContentDb or the
+//! framing templates here. Pure: operates on Mission, no IO.
 
 use crate::*;
-use avalon_content::{Cargo, Effects, Gates, SChoice, Settlement, Storylet, Test};
+use avalon_content::{Effects, Gates, SChoice, Storylet, Terrain, Test};
 
-const FUEL_PER_LEG_ML: i64 = 3_000;
-const DIESEL_BUY_L: i64 = 20;
-const MIN_DEPART_FUEL_ML: i64 = 10_000;
-const JERRY_CAN_PENCE: i64 = 240;
+const START_CASH_PENCE: i64 = 4_320; // £18 of spending money for fuel and bribes
 
-// ---------------------------------------------------------------- contracts
+// ----------------------------------------------------------- generation
 
-pub(crate) fn gen_contract(rng: &mut ChaCha8Rng, content: &ContentDb) -> Contract {
-    let cargo: &Cargo = &content.cargoes[rng.gen_range(0..content.cargoes.len())];
-    let dest: &Settlement = &content.settlements[rng.gen_range(0..content.settlements.len())];
-    let base = cargo.base_pay_pence + rng.gen_range(0..=12) * 25;
-    Contract {
+pub(crate) fn generate(seed: u64, content: &ContentDb) -> Mission {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    let terrain: &Terrain = &content.terrains[rng.gen_range(0..content.terrains.len())];
+    let cargo = &content.cargoes[rng.gen_range(0..content.cargoes.len())];
+    let dest_name = if content.settlements.is_empty() {
+        "the border".to_string()
+    } else {
+        content.settlements[rng.gen_range(0..content.settlements.len())].name.clone()
+    };
+    let diesel_price_pence = rng.gen_range(14..=22);
+    let reward_pence = cargo.base_pay_pence
+        + terrain.legs as i64 * 240
+        + if cargo.illicit { 360 } else { 0 }
+        + rng.gen_range(0..=8) * 25;
+
+    let fixer = npc_or(content, "arthur");
+    let antagonist = pick_present(
+        &mut rng,
+        content,
+        &["hobbs", "finch", "carver"],
+    );
+
+    let mut m = Mission {
+        seed,
+        terrain: terrain.id.clone(),
+        terrain_name: terrain.name.clone(),
+        terrain_flavor: terrain.flavor.clone(),
         cargo: cargo.name.clone(),
         qty_desc: cargo.qty_desc.clone(),
-        dest_id: dest.id.clone(),
-        dest_name: dest.name.clone(),
-        payment_pence: base * (100 + dest.pay_bonus_pct) / 100,
+        dest_name,
         illicit: cargo.illicit,
+        reward_pence,
+        fixer,
+        antagonist,
+        cash_pence: START_CASH_PENCE,
+        diesel_price_pence,
+        fuel_ml: terrain.start_fuel_l * 1_000,
+        max_fuel_ml: terrain.max_fuel_l * 1_000,
+        leg_fuel_ml: terrain.leg_fuel_l * 1_000,
+        wear: terrain.start_wear.clamp(0, MAX_WEAR),
+        heat: 0,
+        dc_mod: terrain.dc_mod,
+        heat_per_leg: terrain.heat_per_leg,
+        wear_per_leg: terrain.wear_per_leg,
+        legs_total: terrain.legs as usize,
+        leg: 0,
+        beats: Vec::new(),
+        stage: Stage::Briefing,
+        outcome: Outcome::InProgress,
+        flags: BTreeSet::new(),
+        talked: false,
+        cargo_lost: false,
+        rng,
+    };
+    // Keep the truck's RNG out of generation's stream by re-seeding play from
+    // a derived seed, so editing generation later doesn't reshuffle the road.
+    m.rng = ChaCha8Rng::seed_from_u64(seed ^ 0x5DEE_CE66);
+    m
+}
+
+fn npc_or(content: &ContentDb, want: &str) -> String {
+    if content.npcs.iter().any(|n| n.id == want) {
+        want.to_string()
+    } else {
+        content.npcs.first().map(|n| n.id.clone()).unwrap_or_default()
     }
 }
 
-fn rumour(rng: &mut ChaCha8Rng) -> &'static str {
-    const RUMOURS: [&str; 5] = [
-        "\"The Collective are stamping everything north of the river since somebody \
-         took their gate off its bracket. Carry your papers where you can reach them.\"",
-        "\"Carver's lot have been buying diesel by the drum. Either they're expecting \
-         trouble, or they're planning to sell it back to us at double.\"",
-        "\"Finch was in on Tuesday asking after your manifest. I told him the truth — \
-         that I couldn't read your handwriting.\"",
-        "\"That belt on the Bedford sounded like a kettle last time you pulled out. \
-         See to it before the long climb.\"",
-        "\"Pulver's boy has been running the night roads in that Leyland. Four fingers \
-         at anyone he passes. One day somebody'll answer with five.\"",
-    ];
-    RUMOURS[rng.gen_range(0..RUMOURS.len())]
+fn pick_present(rng: &mut ChaCha8Rng, content: &ContentDb, pool: &[&str]) -> String {
+    let present: Vec<&str> =
+        pool.iter().copied().filter(|id| content.npcs.iter().any(|n| n.id == *id)).collect();
+    if present.is_empty() {
+        String::new()
+    } else {
+        present[rng.gen_range(0..present.len())].to_string()
+    }
 }
 
 // -------------------------------------------------------------------- gates
 
-fn gates_pass(g: &Gates, w: &WorldState) -> bool {
-    let s = w.guild_suspicion;
-    let wear = w.bedford_wear;
-    if g.min_suspicion.is_some_and(|v| s < v) {
+fn gates_pass(g: &Gates, m: &Mission) -> bool {
+    if g.min_heat.is_some_and(|v| m.heat < v) {
         return false;
     }
-    if g.max_suspicion.is_some_and(|v| s > v) {
+    if g.max_heat.is_some_and(|v| m.heat > v) {
         return false;
     }
-    if g.min_wear.is_some_and(|v| wear < v) {
+    if g.min_wear.is_some_and(|v| m.wear < v) {
         return false;
     }
-    if g.max_wear.is_some_and(|v| wear > v) {
+    if g.max_wear.is_some_and(|v| m.wear > v) {
         return false;
     }
-    if g.illicit.is_some_and(|v| w.run.contract.illicit != v) {
-        return false;
-    }
-    if g.min_runs.is_some_and(|v| w.runs_completed < v) {
+    if g.illicit.is_some_and(|v| m.illicit != v) {
         return false;
     }
     if let Some(f) = &g.flag {
-        if !w.flags.contains(f) && !w.run.flags.contains(f) {
+        if !m.flags.contains(f) {
             return false;
         }
     }
     if let Some(f) = &g.not_flag {
-        if w.flags.contains(f) || w.run.flags.contains(f) {
+        if m.flags.contains(f) {
             return false;
         }
     }
-    if let Some(d) = &g.dest {
-        if &w.run.contract.dest_id != d {
-            return false;
-        }
-    }
-    if let Some(fg) = &g.faction_rep_max {
-        if w.faction(&fg.faction) > fg.value {
-            return false;
-        }
-    }
-    if let Some(fg) = &g.faction_rep_min {
-        if w.faction(&fg.faction) < fg.value {
-            return false;
-        }
+    if !g.terrains.is_empty() && !g.terrains.contains(&m.terrain) {
+        return false;
     }
     true
 }
 
-/// Draw the run's hand: `legs` beats, at most one per template, weighted.
-fn draw_beats(w: &mut WorldState, content: &ContentDb, legs: u32) -> Vec<String> {
-    let mut pool: Vec<&Storylet> =
-        content.storylets.iter().filter(|s| gates_pass(&s.requires, w)).collect();
-    let mut hand = Vec::new();
-    for _ in 0..legs {
-        if pool.is_empty() {
-            break;
-        }
-        let total: u32 = pool.iter().map(|s| s.weight.max(1)).sum();
-        let mut pick = w.rng.gen_range(0..total);
-        let mut chosen = 0;
-        for (i, s) in pool.iter().enumerate() {
-            let wgt = s.weight.max(1);
-            if pick < wgt {
-                chosen = i;
-                break;
-            }
-            pick -= wgt;
-        }
-        let template = pool[chosen].template.clone();
-        hand.push(pool[chosen].id.clone());
-        pool.retain(|s| s.template != template);
+fn template_of<'c>(content: &'c ContentDb, id: &str) -> Option<&'c str> {
+    storylet(content, id).map(|s| s.template.as_str())
+}
+
+/// Lazily draw the next beat given current state: eligible, terrain-matched,
+/// no repeated template this run, weighted. None when the pool is dry.
+fn draw_next(m: &mut Mission, content: &ContentDb) -> Option<String> {
+    let used: BTreeSet<&str> =
+        m.beats.iter().filter_map(|id| template_of(content, id)).collect();
+    let pool: Vec<&Storylet> = content
+        .storylets
+        .iter()
+        .filter(|s| gates_pass(&s.requires, m) && !used.contains(s.template.as_str()))
+        .collect();
+    if pool.is_empty() {
+        return None;
     }
-    hand
+    let total: u32 = pool.iter().map(|s| s.weight.max(1)).sum();
+    let mut pick = m.rng.gen_range(0..total);
+    for s in &pool {
+        let wgt = s.weight.max(1);
+        if pick < wgt {
+            return Some(s.id.clone());
+        }
+        pick -= wgt;
+    }
+    Some(pool[0].id.clone())
 }
 
 // ----------------------------------------------------------- substitutions
 
-fn subst(text: &str, w: &WorldState) -> String {
-    let c = &w.run.contract;
-    text.replace("{dest}", &c.dest_name)
-        .replace("{cargo}", &c.cargo)
-        .replace("{qty}", &c.qty_desc)
-        .replace("{payment}", &fmt_pence(c.payment_pence))
+fn subst(text: &str, m: &Mission) -> String {
+    text.replace("{dest}", &m.dest_name)
+        .replace("{cargo}", &m.cargo)
+        .replace("{qty}", &m.qty_desc)
+        .replace("{terrain}", &m.terrain_name)
+        .replace("{reward}", &fmt_pence(m.reward_pence))
 }
 
 // ------------------------------------------------------------------- scenes
 
-pub(crate) fn scene(w: &WorldState, content: &ContentDb) -> Scene {
-    match &w.run.stage {
-        RunStage::Town => town_scene(w),
-        RunStage::Beat { idx } => beat_scene(w, content, *idx),
-        RunStage::Outcome { text, .. } => Scene {
-            title: "On the Road".into(),
+pub(crate) fn scene(m: &Mission, content: &ContentDb) -> Scene {
+    match &m.stage {
+        Stage::Briefing => briefing_scene(m),
+        Stage::Beat { idx } => beat_scene(m, content, *idx),
+        Stage::Outcome { text, .. } => Scene {
+            title: format!("On {}", m.terrain_name),
             body: vec![text.clone()],
             choices: vec![Choice::on("Drive on")],
+            speaker: None,
         },
-        RunStage::Arrival => arrival_scene(w),
-        RunStage::Summary { lines } => Scene {
-            title: "Ledger Close".into(),
-            body: lines.clone(),
-            choices: vec![Choice::on("Open the next day's ledger")],
-        },
+        Stage::Arrival => arrival_scene(m),
+        Stage::Over => over_scene(m),
     }
 }
 
-fn town_scene(w: &WorldState) -> Scene {
-    let c = &w.run.contract;
+fn briefing_scene(m: &Mission) -> Scene {
     let mut body = vec![
-        "The Wychford depot smells of warm oil and wet sacking. The Bedford TK sits \
-         under the awning, ticking as it cools, while Arthur Pidgeon works through a \
-         stack of dockets with the air of a man besieged."
-            .into(),
         format!(
-            "Chalked on the board: {} of {}, Wychford to {}, {} on delivery. {}",
-            c.qty_desc,
-            c.cargo,
-            c.dest_name,
-            fmt_pence(c.payment_pence),
-            if c.illicit {
-                "Nobody has mentioned Form 4B. Nobody is going to."
-            } else {
-                "All perfectly above board, which is somehow worse."
-            }
+            "Wychford depot, before light. The job: {} of {} out across {}, to {}. \
+             {} on delivery.",
+            m.qty_desc,
+            m.cargo,
+            m.terrain_name,
+            m.dest_name,
+            fmt_pence(m.reward_pence)
         ),
+        m.terrain_flavor.clone(),
     ];
-    if w.guild_suspicion >= 4 {
-        body.push(
-            "A notice by the door invites persons with knowledge of irregular haulage \
-             to come forward. Somebody has drawn a moustache on it."
-                .into(),
-        );
+    if m.illicit {
+        body.push("No Form 4B exists for this load. That is rather the point.".into());
     }
 
-    let diesel_cost = DIESEL_BUY_L * w.diesel_price_pence;
+    let diesel_cost = DIESEL_BUY_L * m.diesel_price_pence;
+    let full = m.fuel_ml >= m.max_fuel_ml;
     let choices = vec![
-        if w.run.talked {
-            Choice::off("Talk to Arthur", "He's said his piece for the day.")
+        if m.talked {
+            Choice::off("Press the fixer further", "He's told you what he'll tell you.")
         } else {
-            Choice::on("Talk to Arthur")
+            Choice::on("Ask the fixer about the road")
         },
-        if w.cash_pence >= diesel_cost {
-            Choice::on(format!("Buy {DIESEL_BUY_L} L diesel ({})", fmt_pence(diesel_cost)))
+        if full {
+            Choice::off("Top up the tank", "She's brimmed.")
+        } else if m.cash_pence >= diesel_cost {
+            Choice::on(format!(
+                "Top up {DIESEL_BUY_L} L ({}) — tank {} L",
+                fmt_pence(diesel_cost),
+                m.fuel_l()
+            ))
         } else {
             Choice::off(
-                format!("Buy {DIESEL_BUY_L} L diesel ({})", fmt_pence(diesel_cost)),
+                format!("Top up {DIESEL_BUY_L} L ({})", fmt_pence(diesel_cost)),
                 "You can't cover it.",
             )
         },
-        if w.run.accepted {
-            Choice::off("Accept the contract", "Signed. After a fashion.")
-        } else {
-            Choice::on("Accept the contract")
-        },
-        if !w.run.accepted {
-            Choice::off(
-                format!("Depart for {}", c.dest_name),
-                "No contract, no cargo, no point.",
-            )
-        } else if w.fuel_ml < MIN_DEPART_FUEL_ML {
-            Choice::off(
-                format!("Depart for {}", c.dest_name),
-                format!("Tank's at {} L. You won't make the climb.", w.fuel_ml / 1_000),
-            )
-        } else {
-            Choice::on(format!("Depart for {}", c.dest_name))
-        },
+        Choice::on(format!("Set off for {}", m.dest_name)),
     ];
-
-    Scene { title: format!("Wychford Depot — {}", w.phase_name()), body, choices }
+    Scene {
+        title: "The Job".into(),
+        body,
+        choices,
+        speaker: Some(m.fixer.clone()),
+    }
 }
 
-fn beat_scene(w: &WorldState, content: &ContentDb, idx: usize) -> Scene {
-    let Some(st) = w.run.beats.get(idx).and_then(|id| storylet(content, id)) else {
-        // A content edit removed a drawn beat mid-run: degrade to a quiet leg.
+fn beat_scene(m: &Mission, content: &ContentDb, idx: usize) -> Scene {
+    let Some(st) = m.beats.get(idx).and_then(|id| storylet(content, id)) else {
         return Scene {
-            title: "The Open Road".into(),
-            body: vec!["The road runs on, empty and wet and entirely without incident, \
-                        which out here counts as a gift."
+            title: format!("On {}", m.terrain_name),
+            body: vec!["The road runs on, empty and without incident, which out here \
+                        counts as a mercy."
                 .into()],
             choices: vec![Choice::on("Drive on")],
+            speaker: None,
         };
     };
     let choices = st
         .choices
         .iter()
         .map(|c| match c.requires_cash {
-            Some(need) if w.cash_pence < need => {
-                Choice::off(subst(&c.label, w), "You can't cover it.")
+            Some(need) if m.cash_pence < need => {
+                Choice::off(subst(&c.label, m), "You can't cover it.")
             }
-            _ => Choice::on(subst(&c.label, w)),
+            _ => Choice::on(subst(&c.label, m)),
         })
         .collect();
     Scene {
-        title: subst(&st.title, w),
-        body: st.body.iter().map(|p| subst(p, w)).collect(),
+        title: subst(&st.title, m),
+        body: st.body.iter().map(|p| subst(p, m)).collect(),
         choices,
+        speaker: template_speaker(&st.template, m),
     }
 }
 
-fn arrival_scene(w: &WorldState) -> Scene {
-    let c = &w.run.contract;
+/// Which face fronts a beat, for the portrait.
+fn template_speaker(template: &str, m: &Mission) -> Option<String> {
+    match template {
+        "checkpoint" => Some(if m.heat >= 4 { "finch".into() } else { "hobbs".into() }),
+        "shakedown" => Some("carver".into()),
+        "traveller" => Some("wray".into()),
+        _ => None,
+    }
+}
+
+fn arrival_scene(m: &Mission) -> Scene {
     Scene {
-        title: format!("{} — The Yard", c.dest_name),
+        title: format!("{} — the drop", m.dest_name),
         body: vec![format!(
-            "The yard at {} is lamp-lit and businesslike. A foreman with a pencil \
-             behind each ear looks the Bedford over the way a farmer looks at weather. \
-             {}",
-            c.dest_name,
-            if c.illicit {
+            "The yard at {} is lamp-lit and businesslike. {}",
+            m.dest_name,
+            if m.illicit {
                 "Nobody asks what's under the sheeting, which is its own kind of manners."
             } else {
                 "The manifest is read aloud, slowly, as if it were scripture."
             }
         )],
         choices: vec![Choice::on("Hand over the cargo")],
+        speaker: None,
     }
+}
+
+fn over_scene(m: &Mission) -> Scene {
+    let (title, lines) = match &m.outcome {
+        Outcome::Won { lines, .. } => ("Delivered".to_string(), lines.clone()),
+        Outcome::Lost { reason, lines } => (format!("Lost — {reason}"), lines.clone()),
+        Outcome::InProgress => ("—".to_string(), vec![]),
+    };
+    Scene { title, body: lines, choices: vec![Choice::on("Begin a new run")], speaker: None }
 }
 
 // -------------------------------------------------------------- transitions
 
-pub(crate) fn choose(w: &mut WorldState, idx: usize, content: &ContentDb, events: &mut Vec<Event>) {
-    match w.run.stage.clone() {
-        RunStage::Town => town_choose(w, idx, content, events),
-        RunStage::Beat { idx: beat } => {
-            let text = resolve_beat(w, content, beat, idx, events);
-            narrate(w, events, text.clone());
-            w.run.stage = RunStage::Outcome { idx: beat, text };
-        }
-        RunStage::Outcome { idx: beat, .. } => {
-            enter_leg(w, events);
-            if beat + 1 < w.run.beats.len() {
-                w.run.stage = RunStage::Beat { idx: beat + 1 };
+pub(crate) fn choose(m: &mut Mission, idx: usize, content: &ContentDb, events: &mut Vec<Event>) {
+    match m.stage.clone() {
+        Stage::Briefing => briefing_choose(m, idx, content, events),
+        Stage::Beat { idx: beat } => {
+            let text = resolve_beat(m, content, beat, idx, events);
+            narrate(events, text.clone());
+            // A beat's effects may have ended the run (caught, broke down,
+            // cargo seized). Otherwise show the outcome and drive on.
+            if let Some((reason, lines)) = check_failure(m) {
+                lose(m, reason, lines, events);
             } else {
-                w.run.stage = RunStage::Arrival;
+                m.stage = Stage::Outcome { idx: beat, text };
             }
         }
-        RunStage::Arrival => deliver(w, content, events),
-        RunStage::Summary { .. } => next_day(w, content, events),
+        Stage::Outcome { idx: beat, .. } => {
+            if beat + 1 < m.legs_total {
+                advance_to_beat(m, content, beat + 1, events);
+            } else {
+                m.stage = Stage::Arrival;
+            }
+        }
+        Stage::Arrival => deliver(m, events),
+        Stage::Over => {} // new run is a daemon concern (fresh seed)
     }
 }
 
-fn town_choose(w: &mut WorldState, idx: usize, content: &ContentDb, events: &mut Vec<Event>) {
+fn briefing_choose(m: &mut Mission, idx: usize, content: &ContentDb, events: &mut Vec<Event>) {
     match idx {
         0 => {
-            w.run.talked = true;
-            let r = rumour(&mut w.rng);
-            narrate(w, events, format!("Arthur, without looking up: {r}"));
+            m.talked = true;
+            narrate(events, briefing_line(m));
         }
         1 => {
-            let cost = DIESEL_BUY_L * w.diesel_price_pence;
-            w.cash_pence -= cost;
-            w.fuel_ml += DIESEL_BUY_L * 1_000;
-            narrate(
-                w,
-                events,
-                format!(
-                    "{DIESEL_BUY_L} litres of diesel, {} the litre. The pump counts it \
-                     out like a creditor.",
-                    fmt_pence(w.diesel_price_pence)
-                ),
-            );
+            let cost = DIESEL_BUY_L * m.diesel_price_pence;
+            if m.cash_pence >= cost && m.fuel_ml < m.max_fuel_ml {
+                m.cash_pence -= cost;
+                m.fuel_ml = (m.fuel_ml + DIESEL_BUY_L * 1_000).min(m.max_fuel_ml);
+                narrate(
+                    events,
+                    format!(
+                        "{DIESEL_BUY_L} litres in, {} the litre. The pump counts it out \
+                         like a creditor.",
+                        fmt_pence(m.diesel_price_pence)
+                    ),
+                );
+            }
         }
         2 => {
-            w.run.accepted = true;
             narrate(
-                w,
-                events,
-                "You sign where signing is expected. Form 4B remains conspicuously blank.",
-            );
-        }
-        3 => {
-            w.run.start_cash = w.cash_pence;
-            w.run.start_fuel_ml = w.fuel_ml;
-            w.run.start_wear = w.bedford_wear;
-            w.run.start_suspicion = w.guild_suspicion;
-            let legs = content
-                .settlements
-                .iter()
-                .find(|s| s.id == w.run.contract.dest_id)
-                .map(|s| s.legs)
-                .unwrap_or(3);
-            w.run.beats = draw_beats(w, content, legs);
-            narrate(
-                w,
                 events,
                 format!(
-                    "The Bedford pulls out of Wychford loaded with {} of {}. The town \
-                     does not wave.",
-                    w.run.contract.qty_desc, w.run.contract.cargo
+                    "The Bedford pulls out of Wychford loaded with {} of {}, nose set for \
+                     {}. The town does not wave.",
+                    m.qty_desc, m.cargo, m.dest_name
                 ),
             );
-            enter_leg(w, events);
-            w.run.stage = RunStage::Beat { idx: 0 };
+            advance_to_beat(m, content, 0, events);
         }
         _ => {}
     }
 }
 
-/// Every leg of road costs a phase and a few litres.
-fn enter_leg(w: &mut WorldState, events: &mut Vec<Event>) {
-    w.tick += 1;
-    w.fuel_ml -= FUEL_PER_LEG_ML;
-    if w.fuel_ml <= 0 {
-        w.fuel_ml = 5_000;
-        let cost = JERRY_CAN_PENCE.min(w.cash_pence);
-        w.cash_pence -= cost;
-        narrate(
-            w,
-            events,
-            format!(
-                "The tank runs dry short of anywhere useful. A farm sells you a jerry \
-                 can at robbery rates ({}), plus the walk.",
-                fmt_pence(cost)
-            ),
-        );
-    }
+fn briefing_line(m: &Mission) -> String {
+    let road = match m.terrain.as_str() {
+        "moor" => "Stay off the skyline where you can. The spotters have nothing to do but watch.",
+        "fen" => "Mind the causeways. The water's been at them and the potholes bite axles.",
+        "forest" => "Pulver's lot work the bends. If a Leyland sits on your tail, it means it.",
+        "coast" => "There's a cutter off the headland counting lights. Don't give them an even number.",
+        "pass" => "Nurse her up the grades. A boiled engine on the pass is a long cold wait.",
+        _ => "Watch yourself out there.",
+    };
+    let who = if m.antagonist.is_empty() {
+        "Nobody's named, which means everybody."
+    } else {
+        "Somebody's been asking after the truck. You know how that goes."
+    };
+    format!("The fixer, not looking up: \"{road} {who}\"")
 }
 
-fn apply_effects(w: &mut WorldState, e: &Effects, events: &mut Vec<Event>) {
-    if let Some(v) = e.cash {
-        w.cash_pence = (w.cash_pence + v).max(0);
-    }
-    if let Some(v) = e.fuel_ml {
-        w.fuel_ml = (w.fuel_ml + v).max(0);
-    }
-    if let Some(v) = e.wear {
-        w.bedford_wear = (w.bedford_wear + v).clamp(0, 10);
-    }
-    if let Some(v) = e.suspicion {
-        w.guild_suspicion = (w.guild_suspicion + v).clamp(0, 10);
-    }
-    if let Some(v) = e.ticks {
-        w.tick = w.tick.saturating_add_signed(v);
-    }
-    if let Some(v) = e.payment_pct {
-        w.run.payment_pct += v;
-    }
-    if let Some(f) = &e.flag {
-        w.run.flags.insert(f.clone());
-        // Flags seeded on the road are facts: attributable, locatable, datable.
-        events.push(Event::Fact {
-            tick: w.tick,
-            fact_id: format!("run{}-{}", w.runs_completed, f),
-            actor: "cobb".into(),
-            action: f.clone(),
-            location: w.run.contract.dest_id.clone(),
-        });
-    }
-    if let (Some(f), Some(d)) = (&e.faction, e.faction_delta) {
-        let v = w.factions.entry(f.clone()).or_insert(0);
-        *v = (*v + d).clamp(-5, 5);
-    }
-}
-
-fn resolve_test(w: &mut WorldState, t: &Test) -> bool {
-    let mut dc = t.dc;
-    if let Some(div) = t.dc_wear_div {
-        if div > 0 {
-            dc += w.bedford_wear / div;
+/// Drive one leg onto beat `idx`: burn fuel, take terrain's toll, draw the
+/// beat, then check whether the leg alone has ended the run.
+fn advance_to_beat(m: &mut Mission, content: &ContentDb, idx: usize, events: &mut Vec<Event>) {
+    m.leg = idx + 1;
+    m.fuel_ml -= m.leg_fuel_ml;
+    if m.fuel_ml <= 0 {
+        if m.cash_pence >= JERRY_CAN_PENCE {
+            m.cash_pence -= JERRY_CAN_PENCE;
+            m.fuel_ml += JERRY_CAN_ML;
+            narrate(
+                events,
+                format!(
+                    "The tank runs dry on the open road. A farm sells you a can at \
+                     robbery rates ({}).",
+                    fmt_pence(JERRY_CAN_PENCE)
+                ),
+            );
+        } else {
+            m.fuel_ml = 0;
+            lose(
+                m,
+                "stranded".into(),
+                vec![
+                    "The needle sits on the pin and the road sits empty. No fuel, no \
+                     fund, no farm in sight."
+                        .into(),
+                    format!("{} of {} go nowhere tonight.", m.qty_desc, m.cargo),
+                ],
+                events,
+            );
+            return;
         }
     }
-    if let Some(bump) = t.dc_susp_bump {
-        if w.guild_suspicion >= 4 {
+    m.heat = (m.heat + m.heat_per_leg).clamp(0, MAX_HEAT);
+    m.wear = (m.wear + m.wear_per_leg).clamp(0, MAX_WEAR);
+
+    if let Some((reason, lines)) = check_failure(m) {
+        lose(m, reason, lines, events);
+        return;
+    }
+    match draw_next(m, content) {
+        Some(id) => {
+            if m.beats.len() <= idx {
+                m.beats.resize(idx + 1, String::new());
+            }
+            m.beats[idx] = id;
+            m.stage = Stage::Beat { idx };
+        }
+        None => m.stage = Stage::Arrival,
+    }
+}
+
+fn apply_effects(m: &mut Mission, e: &Effects) {
+    if let Some(v) = e.cash {
+        m.cash_pence = (m.cash_pence + v).max(0);
+    }
+    if let Some(v) = e.fuel_ml {
+        m.fuel_ml = (m.fuel_ml + v).clamp(0, m.max_fuel_ml);
+    }
+    if let Some(v) = e.wear {
+        m.wear = (m.wear + v).clamp(0, MAX_WEAR);
+    }
+    if let Some(v) = e.heat {
+        m.heat = (m.heat + v).clamp(0, MAX_HEAT);
+    }
+    if let Some(v) = e.payment_pct {
+        m.reward_pence = (m.reward_pence * (100 + v).max(0) / 100).max(0);
+    }
+    if e.lose_cargo.unwrap_or(false) {
+        m.cargo_lost = true;
+    }
+    if let Some(f) = &e.flag {
+        m.flags.insert(f.clone());
+    }
+}
+
+fn resolve_test(m: &mut Mission, t: &Test) -> bool {
+    let mut dc = t.dc + m.dc_mod;
+    if let Some(div) = t.dc_wear_div {
+        if div > 0 {
+            dc += m.wear / div;
+        }
+    }
+    if let Some(bump) = t.dc_heat_bump {
+        if m.heat >= 4 {
             dc += bump;
         }
     }
-    roll(&mut w.rng, skill_value(&t.skill)) >= dc
+    roll(&mut m.rng, skill_value(&t.skill)) >= dc
 }
 
 fn resolve_beat(
-    w: &mut WorldState,
+    m: &mut Mission,
     content: &ContentDb,
     beat: usize,
     choice: usize,
-    events: &mut Vec<Event>,
+    _events: &mut Vec<Event>,
 ) -> String {
-    let Some(st) = w.run.beats.get(beat).and_then(|id| storylet(content, id)) else {
+    let Some(st) = m.beats.get(beat).and_then(|id| storylet(content, id)) else {
         return "The road continues, indifferent.".into();
     };
     let Some(ch): Option<&SChoice> = st.choices.get(choice) else {
@@ -429,148 +479,90 @@ fn resolve_beat(
     };
     let ch = ch.clone();
     match &ch.test {
-        Some(t) if !resolve_test(w, t) => {
+        Some(t) if !resolve_test(m, t) => {
             if let Some(fe) = &ch.fail_effects {
-                apply_effects(w, fe, events);
+                apply_effects(m, fe);
             }
-            subst(ch.fail_outcome.as_deref().unwrap_or("It does not go well."), w)
+            subst(ch.fail_outcome.as_deref().unwrap_or("It does not go well."), m)
         }
         _ => {
-            apply_effects(w, &ch.effects, events);
-            subst(&ch.outcome, w)
+            apply_effects(m, &ch.effects);
+            subst(&ch.outcome, m)
         }
     }
 }
 
-fn deliver(w: &mut WorldState, content: &ContentDb, events: &mut Vec<Event>) {
-    let payment = w.run.contract.payment_pence * w.run.payment_pct.max(0) / 100;
-    w.cash_pence += payment;
-    w.bedford_wear = (w.bedford_wear + 1).min(10);
-    w.runs_completed += 1;
-    narrate(w, events, format!("Counted twice, paid once: {}.", fmt_pence(payment)));
+/// The earned loss conditions. Order matters only for the reported reason.
+fn check_failure(m: &Mission) -> Option<(String, Vec<String>)> {
+    if m.heat >= MAX_HEAT {
+        return Some((
+            "caught".into(),
+            vec![
+                "The block comes out of nowhere and everywhere at once — they have had \
+                 long enough to arrange it. Hands on the bonnet. The sheeting comes off."
+                    .into(),
+                format!("{} of {} change owner, and not to your profit.", m.qty_desc, m.cargo),
+            ],
+        ));
+    }
+    if m.wear >= MAX_WEAR {
+        return Some((
+            "broken down".into(),
+            vec![
+                "Something vital lets go with a noise like a dropped anvil, and the \
+                 Bedford coasts to a stop that has the air of being permanent."
+                    .into(),
+                "By the time help comes, so has everyone else.".into(),
+            ],
+        ));
+    }
+    if m.cargo_lost {
+        return Some((
+            "cargo gone".into(),
+            vec!["Whatever was under the sheeting is under it no longer. A delivery of \
+                  fresh air pays the same as the air."
+                .into()],
+        ));
+    }
+    None
+}
 
+fn lose(m: &mut Mission, reason: String, lines: Vec<String>, events: &mut Vec<Event>) {
+    narrate(events, lines.first().cloned().unwrap_or_default());
+    m.outcome = Outcome::Lost { reason, lines };
+    m.stage = Stage::Over;
+}
+
+fn deliver(m: &mut Mission, events: &mut Vec<Event>) {
+    if let Some((reason, lines)) = check_failure(m) {
+        lose(m, reason, lines, events);
+        return;
+    }
+    let haul = m.reward_pence;
+    narrate(events, format!("Counted twice, paid once: {}.", fmt_pence(haul)));
     let mut lines = vec![
-        format!("Contract settled: {} received.", fmt_pence(payment)),
-        format!(
-            "Cash: {} when you pulled out, {} now.",
-            fmt_pence(w.run.start_cash),
-            fmt_pence(w.cash_pence)
-        ),
-        format!(
-            "Fuel burned: {} L. Bedford wear: {}/10.",
-            (w.run.start_fuel_ml - w.fuel_ml).max(0) / 1_000,
-            w.bedford_wear
-        ),
-        format!(
-            "Guild suspicion: {}/10{}",
-            w.guild_suspicion,
-            if w.guild_suspicion > w.run.start_suspicion { " — and climbing." } else { "." }
-        ),
+        format!("{} of {} delivered to {}.", m.qty_desc, m.cargo, m.dest_name),
+        format!("Haul: {}. Pocket on the road: {}.", fmt_pence(haul), fmt_pence(m.cash_pence)),
+        format!("Brought her in at wear {}/10, heat {}/10.", m.wear, m.heat),
     ];
-    for flag in &w.run.flags {
-        if let Some(line) = foreshadow(flag) {
+    for flag in &m.flags {
+        if let Some(line) = epitaph(flag) {
             lines.push(line.into());
         }
     }
-    lines.push("Form 4B remains unfiled.".into());
-
-    let _ = content;
-    w.run.stage = RunStage::Summary { lines };
+    m.outcome = Outcome::Won { haul_pence: haul, lines };
+    m.stage = Stage::Over;
 }
 
-fn foreshadow(flag: &str) -> Option<&'static str> {
+fn epitaph(flag: &str) -> Option<&'static str> {
     Some(match flag {
-        "gate_smashed" => "The Collective have your numberplate. That will mean something, later.",
-        "bodged_belt" => "The fan belt is a stocking. The Bedford has not forgotten.",
-        "helped_traveller" => "A seed merchant somewhere owes you a kindness.",
-        "passed_traveller" => "A man on the verge of the road has your lights in his ledger.",
-        "bribed_checkpoint" => "A cash box on the north road knows your face now.",
-        "paid_carver" => "Carver's notebook has a tick against your name. Ticks accumulate.",
-        "refused_carver" => "Carver's notebook has a different sort of mark against your name.",
-        "took_salvage" => "Forty tins with no provenance sit in your stash. Tins talk.",
-        "yielded_to_pulver" => "Pulver's boy will tell it as a victory. He'll be believed.",
+        "gate_smashed" => "You left a Collective pole in splinters. They'll remember the plate.",
+        "bribed_checkpoint" => "A cash box on the road knows your face now.",
+        "helped_traveller" => "A seed merchant owes you a kindness. It may even be collected.",
+        "took_salvage" => "Forty unprovenanced tins rode home under the sheeting.",
         "ran_ambush" => "Somebody planned an evening around stopping you, and didn't.",
-        "shaken_down" => "The men with the clean coats have your measure, and your shillings.",
-        "took_drove_lane" => "The drove lane saw you. Drove lanes have friends.",
-        "owes_form_4b" => "You are now formally obliged to apply for a form. On a Tuesday.",
+        "refused_carver" => "You told Carver's men no, to their faces. Word gets about.",
+        "paid_carver" => "Carver's notebook has a tick by your name.",
         _ => return None,
     })
-}
-
-/// Ledger Close: fold run flags into the world, advance to the next dawn,
-/// chalk up a fresh contract.
-fn next_day(w: &mut WorldState, content: &ContentDb, events: &mut Vec<Event>) {
-    let run_flags = std::mem::take(&mut w.run.flags);
-    // Who saw what: facts, observations, gossip — before the run resets.
-    crate::memory::record_run_memories(w, &run_flags, content);
-    w.flags.extend(run_flags);
-
-    w.tick += 1;
-    while w.tick % PHASES_PER_DAY != 0 {
-        w.tick += 1;
-    }
-    drift_diesel(w, events, -2, 2);
-
-    let contract = gen_contract(&mut w.rng, content);
-    w.run = RunState {
-        contract,
-        accepted: false,
-        talked: false,
-        stage: RunStage::Town,
-        beats: Vec::new(),
-        flags: BTreeSet::new(),
-        payment_pct: 100,
-        start_cash: w.cash_pence,
-        start_fuel_ml: w.fuel_ml,
-        start_wear: w.bedford_wear,
-        start_suspicion: w.guild_suspicion,
-    };
-    narrate(
-        w,
-        events,
-        format!("Dawn over Wychford, day {}. New chalk on the board.", w.day()),
-    );
-    if crate::inquiry::maybe_convene(w) {
-        narrate(
-            w,
-            events,
-            "There is something under the Bedford's wiper blade, and it is not a leaflet.",
-        );
-    }
-}
-
-fn drift_diesel(w: &mut WorldState, events: &mut Vec<Event>, lo: i64, hi: i64) {
-    let drift: i64 = w.rng.gen_range(lo..=hi);
-    w.diesel_price_pence = (w.diesel_price_pence + drift).clamp(8, 48);
-    events.push(Event::PriceDrift {
-        tick: w.tick,
-        good: "diesel".into(),
-        settlement: "wychford".into(),
-        price_pence: w.diesel_price_pence,
-    });
-}
-
-/// Offline catch-up. Real days drift the economy and cool officialdom's
-/// interest, but game days do not pass: Cobb does not age while you're away.
-pub(crate) fn catch_up(w: &mut WorldState, days: u64, events: &mut Vec<Event>) {
-    if days == 0 {
-        return;
-    }
-    for _ in 0..days {
-        drift_diesel(w, events, -3, 3);
-        w.guild_suspicion = (w.guild_suspicion - 1).max(0);
-    }
-    narrate(
-        w,
-        events,
-        format!(
-            "While you were away: diesel in Wychford moved to {} the litre{}",
-            fmt_pence(w.diesel_price_pence),
-            if w.guild_suspicion == 0 {
-                ", and nobody official said your name."
-            } else {
-                ". The Guild's interest cooled, a little."
-            }
-        ),
-    );
 }

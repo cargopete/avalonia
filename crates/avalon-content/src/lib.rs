@@ -13,10 +13,37 @@ use std::path::Path;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContentDb {
     pub settlements: Vec<Settlement>,
+    pub terrains: Vec<Terrain>,
     pub cargoes: Vec<Cargo>,
     pub storylets: Vec<Storylet>,
     pub npcs: Vec<Npc>,
     pub banned_phrases: Vec<String>,
+}
+
+/// A road type for one mission. Drives length, fuel pressure, which clock is
+/// dangerous, and which storylets can appear. The variety axis (DR-3).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Terrain {
+    pub id: String,
+    pub name: String,
+    pub flavor: String,
+    /// Beats on the road for this terrain (3..=6).
+    pub legs: u32,
+    /// Tank at the start, litres; and the most you can carry.
+    pub start_fuel_l: i64,
+    pub max_fuel_l: i64,
+    /// Litres burned per leg on this ground.
+    pub leg_fuel_l: i64,
+    /// The truck you're given for this run starts this worn (0..=10). Rough
+    /// ground hands you a tireder Bedford. Defaults to 2.
+    #[serde(default = "default_start_wear")]
+    pub start_wear: i64,
+    /// Added to every skill-test DC on this terrain.
+    pub dc_mod: i64,
+    /// Pursuit (heat) accrued just by being out here, per leg.
+    pub heat_per_leg: i64,
+    /// Truck strain (wear) per leg on this ground.
+    pub wear_per_leg: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,26 +95,23 @@ fn default_weight() -> u32 {
     1
 }
 
+fn default_start_wear() -> i64 {
+    2
+}
+
 /// All gates are ANDed; absent = pass. Numeric gates are inclusive bounds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Gates {
-    pub min_suspicion: Option<i64>,
-    pub max_suspicion: Option<i64>,
+    pub min_heat: Option<i64>,
+    pub max_heat: Option<i64>,
     pub min_wear: Option<i64>,
     pub max_wear: Option<i64>,
     pub illicit: Option<bool>,
     pub flag: Option<String>,
     pub not_flag: Option<String>,
-    pub dest: Option<String>,
-    pub min_runs: Option<u32>,
-    pub faction_rep_max: Option<FactionGate>,
-    pub faction_rep_min: Option<FactionGate>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FactionGate {
-    pub faction: String,
-    pub value: i64,
+    /// Only eligible on these terrains (by id). Empty = any terrain.
+    #[serde(default)]
+    pub terrains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -113,8 +137,8 @@ pub struct Test {
     pub dc: i64,
     /// DC += wear / this (truck-dependent difficulty).
     pub dc_wear_div: Option<i64>,
-    /// DC += this when guild_suspicion >= 4.
-    pub dc_susp_bump: Option<i64>,
+    /// DC += this when heat >= 4 (officialdom is already watching).
+    pub dc_heat_bump: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -122,23 +146,25 @@ pub struct Effects {
     pub cash: Option<i64>,
     pub fuel_ml: Option<i64>,
     pub wear: Option<i64>,
-    pub suspicion: Option<i64>,
-    pub ticks: Option<i64>,
+    /// Pursuit clock. 10 = caught (mission lost).
+    pub heat: Option<i64>,
     pub flag: Option<String>,
-    /// Contract payment adjustment at delivery, percent (spoilage, sweeteners).
+    /// Reward adjustment at the drop, percent (spoilage, sweeteners).
     pub payment_pct: Option<i64>,
-    pub faction: Option<String>,
-    pub faction_delta: Option<i64>,
+    /// Set to lose the cargo outright → mission lost at the drop.
+    pub lose_cargo: Option<bool>,
 }
 
 pub const SKILLS: [&str; 3] = ["paperwork", "spanners", "charm"];
-pub const FACTIONS: [&str; 3] = ["collective", "guild", "carver"];
 
 // ------------------------------------------------------------------ loader
 
 #[derive(Deserialize)]
 struct WorldFile {
+    #[serde(default)]
     settlements: Vec<Settlement>,
+    #[serde(default)]
+    terrains: Vec<Terrain>,
     cargoes: Vec<Cargo>,
     #[serde(default)]
     banned_phrases: Vec<String>,
@@ -160,6 +186,7 @@ pub fn load(dir: &Path) -> Result<ContentDb, String> {
     let world: WorldFile = read(dir.join("world.toml"))?;
     let mut db = ContentDb {
         settlements: world.settlements,
+        terrains: world.terrains,
         cargoes: world.cargoes,
         banned_phrases: world.banned_phrases,
         ..Default::default()
@@ -198,18 +225,21 @@ fn sorted_toml(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 
 pub fn validate(db: &ContentDb) -> Result<(), String> {
     let mut errs = Vec::new();
-    let settlement_ids: BTreeSet<_> = db.settlements.iter().map(|s| s.id.as_str()).collect();
+    let terrain_ids: BTreeSet<_> = db.terrains.iter().map(|t| t.id.as_str()).collect();
     let mut seen = BTreeSet::new();
 
-    if db.settlements.is_empty() {
-        errs.push("no settlements defined".into());
+    if db.terrains.is_empty() {
+        errs.push("no terrains defined".into());
     }
     if db.cargoes.is_empty() {
         errs.push("no cargoes defined".into());
     }
-    for s in &db.settlements {
-        if !(1..=8).contains(&s.legs) {
-            errs.push(format!("settlement {}: legs must be 1..=8", s.id));
+    for t in &db.terrains {
+        if !(2..=8).contains(&t.legs) {
+            errs.push(format!("terrain {}: legs must be 2..=8", t.id));
+        }
+        if t.start_fuel_l <= 0 || t.max_fuel_l < t.start_fuel_l {
+            errs.push(format!("terrain {}: fuel bounds nonsensical", t.id));
         }
     }
     for st in &db.storylets {
@@ -219,9 +249,9 @@ pub fn validate(db: &ContentDb) -> Result<(), String> {
         if st.choices.is_empty() {
             errs.push(format!("storylet {}: no choices", st.id));
         }
-        if let Some(d) = &st.requires.dest {
-            if !settlement_ids.contains(d.as_str()) {
-                errs.push(format!("storylet {}: unknown dest gate {d}", st.id));
+        for tid in &st.requires.terrains {
+            if !terrain_ids.contains(tid.as_str()) {
+                errs.push(format!("storylet {}: unknown terrain gate {tid}", st.id));
             }
         }
         for (i, c) in st.choices.iter().enumerate() {
@@ -233,16 +263,10 @@ pub fn validate(db: &ContentDb) -> Result<(), String> {
                     errs.push(format!("storylet {} choice {i}: test without fail_outcome", st.id));
                 }
             }
-            for f in [&c.effects.faction, &c.fail_effects.as_ref().and_then(|e| e.faction.clone())]
-            {
-                if let Some(f) = f {
-                    if !FACTIONS.contains(&f.as_str()) {
-                        errs.push(format!("storylet {} choice {i}: unknown faction {f}", st.id));
-                    }
-                }
-            }
         }
     }
+    // Every terrain needs enough always-eligible (untagged or matching) beats
+    // to fill a run without repeating a template.
     let templates: BTreeSet<_> = db.storylets.iter().map(|s| s.template.as_str()).collect();
     if templates.len() < 3 && !db.storylets.is_empty() {
         errs.push("fewer than 3 beat templates; runs will repeat".into());

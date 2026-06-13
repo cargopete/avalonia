@@ -23,7 +23,7 @@ outcome = "You hold your line and your schedule. In the mirror he doesn't wave. 
 id = "traveller_setup"
 template = "traveller"
 weight = 2
-requires = { min_suspicion = 3, illicit = true }
+requires = { min_heat = 3, illicit = true }
 title = "A Convenient Breakdown"
 body = [
   "A car angled across half the road, bonnet up, and a man beside it whose coat is too clean for a man who has been wrestling an engine. He waves with both arms. The hedge behind him is the kind of hedge that could hold three more men, and the light is going.",
@@ -56,7 +56,7 @@ label = "Hold your line and your nerve"
 test = { skill = "charm", dc = 8 }
 outcome = "You look back at him the way Arthur looks at a docket that doesn't add up. The four fingers become a shrug; the Leyland drops back. There is an order to these things, and today you outrank a scarf."
 fail_outcome = "He flicks the cigarette at your windscreen and cuts in hard enough to put your nearside in the ditch grass. By the time the wheel stops fighting you, the Leyland is a smell of exhaust. Word will go round that Cobb gave way."
-fail_effects = { wear = 1, suspicion = 1, flag = "yielded_to_pulver" }
+fail_effects = { wear = 1, heat = 1, flag = "yielded_to_pulver" }
 
 [[storylet.choices]]
 label = "Wave him on, all courtesy"
@@ -98,7 +98,7 @@ body = [
 
 [[storylet.choices]]
 label = "Load what fits"
-effects = { cash = 240, suspicion = 1, flag = "took_salvage" }
+effects = { cash = 240, heat = 1, flag = "took_salvage" }
 outcome = "Forty tins ride home under your sheeting. Salvage, you tell yourself, has a long and respectable maritime tradition, and a ditch is practically the sea. The tins do not argue. Somewhere, eventually, a carter will."
 
 [[storylet.choices]]

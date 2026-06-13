@@ -1,10 +1,12 @@
-//! avalond — the local daemon: axum API, SSE, SQLite save, sessions, jobs
-//! (RFC-AVL-001 DR-1/DR-4/DR-5).
+//! avalond — the local daemon (RFC-AVL-001 DR-1/DR-5), reshaped for ephemeral
+//! single-mission play: one in-memory `Mission` at a time, no save/resume.
+//! `/api/new` rolls a fresh run; closing the tab abandons it. SQLite keeps
+//! only a scoreboard of finished runs.
 
 mod llm;
 
 use avalon_orchestrator::{LlmConfig, Orchestrator};
-use avalon_sim::{scene, step, Command, ContentDb, Event, Scene, WorldState};
+use avalon_sim::{scene, step, Command, ContentDb, Event, Mission, Outcome, Scene};
 use axum::extract::State;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -15,111 +17,129 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tower_http::services::{ServeDir, ServeFile};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
+use tower_http::services::{ServeDir, ServeFile};
 
 fn bind_addr() -> String {
     std::env::var("AVALON_BIND").unwrap_or_else(|_| "127.0.0.1:4747".into())
 }
-const DEFAULT_SEED: u64 = 0xC0BB;
 
-/// Schema migrations, applied in order; PRAGMA user_version tracks progress.
-/// Append-only: never edit a shipped entry (DR-4).
+/// Append-only migrations; PRAGMA user_version tracks progress (DR-4).
 const MIGRATIONS: &[&str] = &[
-    // v1: meta (world snapshot, schema bookkeeping) + canonical event log
-    "CREATE TABLE meta(key TEXT PRIMARY KEY, val TEXT NOT NULL);
-     CREATE TABLE events(
+    // v1/v2 (persistent-world era) are retired; recreate them as no-ops so a
+    // fresh DB lands on the same user_version as upgraded ones.
+    "SELECT 1;",
+    "SELECT 1;",
+    // v3: the scoreboard — the only thing that outlives a mission.
+    "CREATE TABLE IF NOT EXISTS scores(
          id INTEGER PRIMARY KEY,
-         tick INTEGER NOT NULL,
-         kind TEXT NOT NULL,
-         payload TEXT NOT NULL
-     );
-     CREATE INDEX idx_events_tick ON events(tick);",
-    // v2: idle-lane job queue + embedding cache (Stage 3/4)
-    "CREATE TABLE jobs(
-         id INTEGER PRIMARY KEY,
-         kind TEXT NOT NULL,
-         payload TEXT NOT NULL,
-         state TEXT NOT NULL DEFAULT 'queued',
-         attempts INTEGER NOT NULL DEFAULT 0,
-         created_at INTEGER DEFAULT (unixepoch())
-     );
-     CREATE INDEX idx_jobs_state ON jobs(state);
-     CREATE TABLE embeddings(memory_id INTEGER PRIMARY KEY, vec BLOB NOT NULL);",
+         outcome TEXT NOT NULL,
+         reason TEXT,
+         haul_pence INTEGER NOT NULL DEFAULT 0,
+         terrain TEXT NOT NULL,
+         cargo TEXT NOT NULL,
+         seed INTEGER NOT NULL,
+         finished_at INTEGER NOT NULL
+     );",
 ];
 
 pub(crate) struct App {
     content: Arc<ContentDb>,
     orch: Arc<Orchestrator>,
-    world: Mutex<WorldState>,
+    /// The one live run, or None at the start screen.
+    mission: Mutex<Option<Mission>>,
+    /// Mission-scoped fixer chat log (cleared on new/abandon).
+    chat: Mutex<Vec<(String, String)>>,
     db: Mutex<Connection>,
     tx: broadcast::Sender<String>,
 }
 
+// --------------------------------------------------------------- view DTOs
+
 #[derive(Serialize)]
-struct StateView {
-    tick: u64,
-    day: u64,
-    phase: &'static str,
+struct MissionView {
+    terrain: String,
+    terrain_name: String,
+    cargo: String,
+    qty_desc: String,
+    dest_name: String,
+    illicit: bool,
+    reward_pence: i64,
     cash_pence: i64,
     fuel_l: i64,
-    diesel_price_pence: i64,
-    bedford_wear: i64,
-    guild_suspicion: i64,
-    runs_completed: u32,
-    cargo: Option<String>,
+    fuel_pct: i64,
+    max_fuel_l: i64,
+    wear: i64,
+    heat: i64,
+    leg: usize,
+    legs_total: usize,
+    fixer: String,
+    antagonist: String,
+    outcome: &'static str,
+    reason: Option<String>,
+    haul_pence: Option<i64>,
+    scene: Scene,
+}
+
+#[derive(Serialize, Default)]
+struct Scores {
+    played: i64,
+    won: i64,
+    lost: i64,
+    best_haul_pence: i64,
 }
 
 #[derive(Serialize)]
 struct View {
-    state: StateView,
-    scene: Scene,
+    active: bool,
+    mission: Option<MissionView>,
+    scores: Scores,
 }
 
-#[derive(Deserialize)]
-struct ChooseReq {
-    idx: usize,
-}
-
-#[derive(Deserialize)]
-struct SayReq {
-    npc: String,
-    text: String,
-}
-
-impl StateView {
-    fn of(w: &WorldState) -> Self {
+impl MissionView {
+    fn of(m: &Mission, content: &ContentDb) -> Self {
+        let (outcome, reason, haul) = match &m.outcome {
+            Outcome::InProgress => ("in_progress", None, None),
+            Outcome::Won { haul_pence, .. } => ("won", None, Some(*haul_pence)),
+            Outcome::Lost { reason, .. } => ("lost", Some(reason.clone()), None),
+        };
         Self {
-            tick: w.tick,
-            day: w.day(),
-            phase: w.phase_name(),
-            cash_pence: w.cash_pence,
-            fuel_l: w.fuel_ml / 1_000,
-            diesel_price_pence: w.diesel_price_pence,
-            bedford_wear: w.bedford_wear,
-            guild_suspicion: w.guild_suspicion,
-            runs_completed: w.runs_completed,
-            cargo: w
-                .run
-                .accepted
-                .then(|| format!("{} → {}", w.run.contract.cargo, w.run.contract.dest_name)),
+            terrain: m.terrain.clone(),
+            terrain_name: m.terrain_name.clone(),
+            cargo: m.cargo.clone(),
+            qty_desc: m.qty_desc.clone(),
+            dest_name: m.dest_name.clone(),
+            illicit: m.illicit,
+            reward_pence: m.reward_pence,
+            cash_pence: m.cash_pence,
+            fuel_l: m.fuel_l(),
+            fuel_pct: m.fuel_pct(),
+            max_fuel_l: m.max_fuel_ml / 1_000,
+            wear: m.wear,
+            heat: m.heat,
+            leg: m.leg,
+            legs_total: m.legs_total,
+            fixer: m.fixer.clone(),
+            antagonist: m.antagonist.clone(),
+            outcome,
+            reason,
+            haul_pence: haul,
+            scene: scene(m, content),
         }
     }
 }
 
-fn view_of(w: &WorldState, c: &ContentDb) -> View {
-    View { state: StateView::of(w), scene: scene(w, c) }
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn epoch_day() -> i64 {
-    (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before 1970")
-        .as_secs()
-        / 86_400) as i64
+fn fresh_seed() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0xC0BB)
 }
+
+// ----------------------------------------------------------------- db
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -133,102 +153,123 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT val FROM meta WHERE key = ?1", [key], |r| r.get(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })
+fn read_scores(conn: &Connection) -> Scores {
+    conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(outcome = 'won'), 0),
+                COALESCE(SUM(outcome = 'lost'), 0),
+                COALESCE(MAX(haul_pence), 0)
+         FROM scores",
+        [],
+        |r| Ok(Scores { played: r.get(0)?, won: r.get(1)?, lost: r.get(2)?, best_haul_pence: r.get(3)? }),
+    )
+    .unwrap_or_default()
 }
 
-fn meta_set(conn: &Connection, key: &str, val: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO meta(key, val) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET val = ?2",
-        [key, val],
-    )?;
-    Ok(())
+/// Record a finished mission once. Idempotency: callers null the mission's
+/// outcome path by only recording on the transition into Over.
+fn record_score(conn: &Connection, m: &Mission) {
+    let (outcome, reason, haul) = match &m.outcome {
+        Outcome::Won { haul_pence, .. } => ("won", None, *haul_pence),
+        Outcome::Lost { reason, .. } => ("lost", Some(reason.as_str()), 0),
+        Outcome::InProgress => return,
+    };
+    let _ = conn.execute(
+        "INSERT INTO scores(outcome, reason, haul_pence, terrain, cargo, seed, finished_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![outcome, reason, haul, m.terrain, m.cargo, m.seed as i64, now_secs()],
+    );
 }
 
-fn load_world(conn: &Connection, content: &ContentDb) -> rusqlite::Result<WorldState> {
-    Ok(match meta_get(conn, "world")? {
-        Some(json) => match serde_json::from_str(&json) {
-            Ok(w) => w,
-            Err(e) => {
-                // Stage 1 only: snapshot-shape changes start a fresh world.
-                // Real saves get forward-migrations before anything ships.
-                eprintln!("avalond: snapshot incompatible ({e}); starting a fresh world");
-                WorldState::new(DEFAULT_SEED, content)
-            }
-        },
-        None => WorldState::new(DEFAULT_SEED, content),
-    })
-}
+// --------------------------------------------------------------- handlers
 
-fn persist(conn: &Connection, world: &WorldState, events: &[Event]) -> rusqlite::Result<()> {
-    let json = serde_json::to_string(world).expect("WorldState is always serializable");
-    meta_set(conn, "world", &json)?;
-    meta_set(conn, "last_epoch_day", &epoch_day().to_string())?;
-    for ev in events {
-        let value = serde_json::to_value(ev).expect("Event is always serializable");
-        let kind = value["kind"].as_str().unwrap_or("unknown").to_string();
-        conn.execute(
-            "INSERT INTO events(tick, kind, payload) VALUES(?1, ?2, ?3)",
-            rusqlite::params![world.tick as i64, kind, value.to_string()],
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn apply(app: &App, cmd: Command) -> View {
-    let mut w = app.world.lock().unwrap();
-    let memory_watermark = w.next_memory_id;
-    let (next, events) = step(&w, &cmd, &app.content);
-    {
+fn view_payload(app: &App) -> View {
+    let guard = app.mission.lock().unwrap();
+    let scores = {
         let conn = app.db.lock().unwrap();
-        persist(&conn, &next, &events).expect("persist failed");
-        llm::enqueue_for_new_memories(&conn, &next, memory_watermark);
+        read_scores(&conn)
+    };
+    match guard.as_ref() {
+        Some(m) => View { active: true, mission: Some(MissionView::of(m, &app.content)), scores },
+        None => View { active: false, mission: None, scores },
     }
-    for ev in &events {
-        let _ = app.tx.send(serde_json::to_string(ev).unwrap());
-    }
-    *w = next;
-    view_of(&w, &app.content)
 }
 
 async fn get_view(State(app): State<Arc<App>>) -> Json<View> {
-    let w = app.world.lock().unwrap();
-    Json(view_of(&w, &app.content))
+    Json(view_payload(&app))
+}
+
+async fn new_mission(State(app): State<Arc<App>>) -> Json<View> {
+    {
+        let mut guard = app.mission.lock().unwrap();
+        *guard = Some(Mission::new(fresh_seed(), &app.content));
+        app.chat.lock().unwrap().clear();
+    }
+    Json(view_payload(&app))
+}
+
+async fn abandon(State(app): State<Arc<App>>) {
+    *app.mission.lock().unwrap() = None;
+    app.chat.lock().unwrap().clear();
+}
+
+#[derive(Deserialize)]
+struct ChooseReq {
+    idx: usize,
 }
 
 async fn choose(State(app): State<Arc<App>>, Json(req): Json<ChooseReq>) -> Json<View> {
-    Json(apply(&app, Command::Choose { idx: req.idx }))
+    {
+        let mut guard = app.mission.lock().unwrap();
+        if let Some(m) = guard.as_ref() {
+            let was_over = m.outcome.is_over();
+            let (next, events) = step(m, &Command::Choose { idx: req.idx }, &app.content);
+            for ev in &events {
+                let Event::Narration { text } = ev;
+                let _ = app.tx.send(text.clone());
+            }
+            // Record the score exactly once: on the transition into Over.
+            if !was_over && next.outcome.is_over() {
+                let conn = app.db.lock().unwrap();
+                record_score(&conn, &next);
+            }
+            *guard = Some(next);
+        }
+    }
+    Json(view_payload(&app))
 }
 
-async fn say(
-    State(app): State<Arc<App>>,
-    Json(req): Json<SayReq>,
-) -> Json<serde_json::Value> {
+#[derive(Deserialize)]
+struct SayReq {
+    npc: String,
+    text: String,
+}
+
+async fn say(State(app): State<Arc<App>>, Json(req): Json<SayReq>) -> Json<serde_json::Value> {
     let text = req.text.trim().to_string();
     if text.is_empty() || text.len() > 400 {
         return Json(serde_json::json!({ "line": "…", "fallback": true }));
     }
-    let (line, fallback) = llm::npc_reply(&app, &req.npc, &text).await;
-    Json(serde_json::json!({ "npc": req.npc, "line": line, "fallback": fallback }))
+    let npc = if req.npc.is_empty() {
+        app.mission.lock().unwrap().as_ref().map(|m| m.fixer.clone()).unwrap_or_default()
+    } else {
+        req.npc
+    };
+    let (line, fallback) = llm::npc_reply(&app, &npc, &text).await;
+    Json(serde_json::json!({ "npc": npc, "line": line, "fallback": fallback }))
 }
 
 async fn status(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    let jobs: i64 = {
-        let conn = app.db.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM jobs WHERE state = 'queued' AND attempts < 2", [], |r| r.get(0))
-            .unwrap_or(0)
-    };
-    Json(serde_json::json!({ "llm": app.orch.available().await, "queued_jobs": jobs }))
+    Json(serde_json::json!({ "llm": app.orch.available().await }))
 }
 
-async fn debug_world(State(app): State<Arc<App>>) -> Json<WorldState> {
-    Json(app.world.lock().unwrap().clone())
+async fn stream(
+    State(app): State<Arc<App>>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let rx = app.tx.subscribe();
+    let s = BroadcastStream::new(rx)
+        .filter_map(|msg| msg.ok().map(|m| Ok(SseEvent::default().data(m))));
+    Sse::new(s).keep_alive(KeepAlive::default())
 }
 
 /// Basic Auth gate, active only when AVALON_TOKEN is set. User: cobb.
@@ -256,18 +297,9 @@ async fn auth_gate(
     }
     axum::response::Response::builder()
         .status(axum::http::StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", "Basic realm=\"the corn exchange\"")
+        .header("WWW-Authenticate", "Basic realm=\"the depot\"")
         .body("Form 7C: credentials required, in duplicate.".into())
         .unwrap()
-}
-
-async fn stream(
-    State(app): State<Arc<App>>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = app.tx.subscribe();
-    let stream = BroadcastStream::new(rx)
-        .filter_map(|msg| msg.ok().map(|m| Ok(SseEvent::default().data(m))));
-    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[tokio::main]
@@ -281,45 +313,17 @@ async fn main() {
     let conn = Connection::open(&save_path).expect("open save db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("WAL");
     migrate(&conn).expect("migrations");
+
     let content_dir: PathBuf = std::env::var("AVALON_CONTENT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("content"));
     let content = Arc::new(avalon_content::load(&content_dir).expect("content validates"));
     println!(
-        "avalond: content loaded — {} storylets, {} settlements, {} npcs",
+        "avalond: content — {} terrains, {} storylets, {} cargoes, {} npcs",
+        content.terrains.len(),
         content.storylets.len(),
-        content.settlements.len(),
+        content.cargoes.len(),
         content.npcs.len()
-    );
-    let mut world = load_world(&conn, &content).expect("load world");
-
-    // Delta-time: real days away drift the economy (Command::CatchUp keeps
-    // the sim pure; the wall clock stays out here in the impure shell).
-    let away_days = meta_get(&conn, "last_epoch_day")
-        .expect("read last_epoch_day")
-        .and_then(|s| s.parse::<i64>().ok())
-        .map(|last| (epoch_day() - last).max(0) as u64)
-        .unwrap_or(0);
-    if away_days > 0 {
-        let (next, events) = step(&world, &Command::CatchUp { days: away_days }, &content);
-        persist(&conn, &next, &events).expect("persist catch-up");
-        // The digest job rewrites the templated note in voice, later, idly.
-        if let Some(Event::Narration { text, .. }) =
-            events.iter().rev().find(|e| matches!(e, Event::Narration { .. }))
-        {
-            llm::enqueue(&conn, "digest", serde_json::json!({ "text": text }));
-        }
-        world = next;
-        println!("avalond: caught up {away_days} day(s) away");
-    }
-
-    println!(
-        "avalond: world at tick {} (day {}, {}), {} runs done, save {}",
-        world.tick,
-        world.day(),
-        world.phase_name(),
-        world.runs_completed,
-        save_path.display()
     );
 
     let (tx, _) = broadcast::channel(256);
@@ -330,31 +334,27 @@ async fn main() {
     let app = Arc::new(App {
         content,
         orch,
-        world: Mutex::new(world),
+        mission: Mutex::new(None),
+        chat: Mutex::new(Vec::new()),
         db: Mutex::new(conn),
         tx,
     });
-
-    // The idle lane: reflections, gossip rewording, embeddings, digests.
-    tokio::spawn(llm::idle_worker(app.clone()));
     println!(
         "avalond: llm at {} ({})",
         app.orch.cfg.host,
         if app.orch.available().await { "reachable" } else { "unreachable — fallbacks only" }
     );
 
-    // Serve the built SPA when web/dist exists (one port for everything);
-    // dev keeps using Vite on :5173 with its /api proxy.
     let dist = PathBuf::from("web/dist");
-    let static_svc =
-        ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
+    let static_svc = ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
 
     let router = Router::new()
         .route("/api/view", get(get_view))
+        .route("/api/new", post(new_mission))
+        .route("/api/abandon", post(abandon))
         .route("/api/choose", post(choose))
         .route("/api/say", post(say))
         .route("/api/status", get(status))
-        .route("/api/debug/world", get(debug_world))
         .route("/api/stream", get(stream))
         .fallback_service(static_svc)
         .layer(axum::middleware::from_fn(auth_gate))
@@ -364,11 +364,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     println!(
         "avalond: listening on http://{bind} (auth: {})",
-        if std::env::var("AVALON_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) {
-            "on"
-        } else {
-            "off"
-        }
+        if std::env::var("AVALON_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) { "on" } else { "off" }
     );
     axum::serve(listener, router).await.expect("serve");
 }

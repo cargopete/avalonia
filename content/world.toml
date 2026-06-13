@@ -1,9 +1,78 @@
-# Avalon — world data. Settlements, cargoes, and the tone lint's banned list.
+# Avalon — world data. Terrains, settlements (destinations), cargoes, and the
+# tone lint's banned list. A mission rolls one terrain; the terrain sets the
+# road's length, fuel pressure, which clock will kill you, and difficulty.
 
 banned_phrases = [
   "delve", "tapestry", "testament to", "I daresay", "I warrant",
   "vibrant", "bustling", "nestled", "—and yet—",
 ]
+
+# --- terrains: the variety axis. Tuned together with engine.rs for ~60% loss.
+
+[[terrains]]
+id = "moor"
+name = "the high moor"
+flavor = "Open moorland, no cover and no witnesses but the sky. The Collective's spotters love it up here."
+legs = 4
+start_fuel_l = 24
+max_fuel_l = 36
+leg_fuel_l = 6
+start_wear = 2
+dc_mod = 1
+heat_per_leg = 2
+wear_per_leg = 0
+
+[[terrains]]
+id = "fen"
+name = "the fen roads"
+flavor = "Flooded droves and rotten causeways. The water hides the potholes until the axle finds them."
+legs = 4
+start_fuel_l = 24
+max_fuel_l = 34
+leg_fuel_l = 6
+start_wear = 3
+dc_mod = 1
+heat_per_leg = 2
+wear_per_leg = 1
+
+[[terrains]]
+id = "forest"
+name = "the forest road"
+flavor = "Close timber on both sides, blind bends, and Pulver's lot know every one of them. Ambush country."
+legs = 4
+start_fuel_l = 26
+max_fuel_l = 40
+leg_fuel_l = 6
+start_wear = 2
+dc_mod = 1
+heat_per_leg = 2
+wear_per_leg = 1
+
+[[terrains]]
+id = "coast"
+name = "the coast road"
+flavor = "Salt, smugglers' luck, and a customs cutter somewhere off the headland watching the lights come and go."
+legs = 3
+start_fuel_l = 20
+max_fuel_l = 30
+leg_fuel_l = 6
+start_wear = 2
+dc_mod = 1
+heat_per_leg = 3
+wear_per_leg = 0
+
+[[terrains]]
+id = "pass"
+name = "the mountain pass"
+flavor = "Up into the cold, where the engine labours and the road is one bad gear-change from a long drop."
+legs = 4
+start_fuel_l = 26
+max_fuel_l = 42
+leg_fuel_l = 6
+start_wear = 4
+dc_mod = 1
+heat_per_leg = 2
+wear_per_leg = 1
 
 [[settlements]]
 id = "draycote"

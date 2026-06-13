@@ -12,26 +12,26 @@ body = [
 [[storylet.choices]]
 label = "Present your papers"
 outcome = "He reads every line twice, stamps the docket hard enough to wake the kettle, and waves you through with visible regret."
-test = { skill = "paperwork", dc = 9, dc_susp_bump = 2 }
+test = { skill = "paperwork", dc = 9, dc_heat_bump = 2 }
 fail_outcome = "He reads the manifest, then reads you. 'This column,' he says, 'is the wrong shape.' The fine is 25s, receipted in triplicate. Suspicion travels faster than the truck."
-fail_effects = { cash = -300, suspicion = 2, faction = "collective", faction_delta = -1 }
+fail_effects = { cash = -300, heat = 2, faction = "collective", faction_delta = -1 }
 
 [[storylet.choices]]
 label = "Offer the 'paperwork fee' (10s)"
 requires_cash = 120
-effects = { cash = -120, suspicion = 1, flag = "bribed_checkpoint" }
+effects = { cash = -120, heat = 1, flag = "bribed_checkpoint" }
 outcome = "The fee disappears into the cash box with the practised ease of a thing that happens forty times a day. The pole goes up. The kettle screams."
 
 [[storylet.choices]]
 label = "Through the pole"
-effects = { wear = 2, suspicion = 3, flag = "gate_smashed", faction = "collective", faction_delta = -2 }
+effects = { wear = 2, heat = 3, flag = "gate_smashed", faction = "collective", faction_delta = -2 }
 outcome = "You drop a gear and take the pole at speed. It departs its bracket with a noise like a shot pheasant. In the mirror: a young man writing down your numberplate, carefully."
 
 [[storylet]]
 id = "checkpoint_zealous"
 template = "checkpoint"
 weight = 2
-requires = { min_suspicion = 4 }
+requires = { min_heat = 4 }
 title = "A Thorough Young Man"
 body = [
   "This barrier has a table. On the table: a typewriter, a stack of Form 7As, and a photograph, face down. The corporal turns it over without being asked. It is a photograph of your Bedford. 'We circulate these now,' he says, almost apologetically.",
@@ -42,11 +42,11 @@ label = "Brazen it out"
 test = { skill = "charm", dc = 10 }
 outcome = "You remark that the photograph flatters the radiator. He fights the smile and loses. 'Go on. Weighbridge is broken anyway.'"
 fail_outcome = "He is not amused, and the search that follows is conducted in the spirit of a man looking for a promotion. An hour gone and a 'provisional surcharge' of 30s."
-fail_effects = { cash = -360, ticks = 1, suspicion = 1 }
+fail_effects = { cash = -360, ticks = 1, heat = 1 }
 
 [[storylet.choices]]
 label = "Volunteer for inspection"
-effects = { ticks = 1, suspicion = -1 }
+effects = { ticks = 1, heat = -1 }
 outcome = "You open everything before he asks. The performance of innocence is itself suspicious, but it is also boring, and boredom wins. He initials three forms and lifts the pole."
 
 [[storylet.choices]]
@@ -58,7 +58,7 @@ outcome = "The drove lane was made for cattle, by cattle. The Bedford takes it p
 id = "inspection_forms"
 template = "checkpoint"
 weight = 2
-requires = { max_suspicion = 3 }
+requires = { max_heat = 3 }
 title = "The Mobile Sub-Office"
 body = [
   "A caravan parked broadside to the road, signed MOBILE SUB-OFFICE OF THE JOINT COMMITTEE ON ROAD USAGE (PROVISIONAL). Inside, a clerk who introduces himself as Mr. Finch is sorting rubber stamps by size. He requires, he says, only a moment. He requires Form 4B.",
@@ -76,4 +76,4 @@ label = "Claim exemption under the Agricultural Carriage Act"
 test = { skill = "charm", dc = 9 }
 outcome = "You cite the Act with the confidence of a man who has never read it, to a man who wrote part of it. Mercifully, the part he wrote agrees with you. He waves you on, delighted to see the legislation used."
 fail_outcome = "Finch knows the Act. Finch loves the Act. You have insulted the Act. The fine is 20s and he reads you Section 11 while you count it out."
-fail_effects = { cash = -240, suspicion = 1 }
+fail_effects = { cash = -240, heat = 1 }

@@ -1,38 +1,31 @@
 //! avalon-sim — the pure deterministic core (RFC-AVL-001 DR-7).
 //!
-//! No tokio, no IO, no wall clocks, no Ollama. Time is integer ticks, money is
-//! integer pence, fuel is millilitres, RNG is seeded ChaCha8 carried inside the
-//! world state so replays are bit-exact:
-//! `(WorldState, Command, &ContentDb) -> (WorldState, Vec<Event>)`.
+//! No tokio, no IO, no wall clocks, no Ollama. Money is integer pence, fuel is
+//! millilitres, RNG is seeded ChaCha8 carried inside the state so replays are
+//! bit-exact: `(Mission, Command, &ContentDb) -> (Mission, Vec<Event>)`.
 //!
-//! Stage 2: beats come from the TOML storylet deck (gates → prose → effects).
-//! The scene presented to the player is a pure function of state + content;
-//! choices are validated against it before any transition. LLM text enters
-//! canon only via recorded-oracle commands the daemon issues after validation.
+//! The game is a roguelike run generator: each `Mission` is self-contained —
+//! roll a terrain, a cargo, a destination, a cast; drive the legs; win by
+//! delivering or lose by getting caught, breaking down, or running dry. Tuned
+//! so a sensible playthrough loses ~60% of the time (see the `loss_rate` test).
+//! Nothing persists between missions.
+//!
+//! The persistent-world systems (NPC memory, gossip, The Inquiry) are shelved
+//! under `src/_shelved/` — out of the build, kept for a future mode.
 
 mod engine;
-pub mod inquiry;
-pub mod memory;
 
 pub use avalon_content::ContentDb;
-pub use inquiry::InquiryState;
-pub use memory::{FactAttrs, FactRec, MemoryEntry};
 
 use avalon_content::Storylet;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
-/// One tick = one phase of the day; five phases per day, Thrushcombe-style.
-pub type Tick = u64;
-
-pub const PHASES_PER_DAY: u64 = 5;
-pub const PHASE_NAMES: [&str; 5] = ["dawn", "forenoon", "afternoon", "evening", "night"];
-
-/// Cobb's fixed aptitudes (a character sheet can wait).
+/// Cobb's fixed aptitudes. A d12 + skill beats the test's DC.
 pub fn skill_value(name: &str) -> i64 {
     match name {
         "paperwork" => 2,
@@ -42,131 +35,105 @@ pub fn skill_value(name: &str) -> i64 {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Contract {
-    pub cargo: String,
-    pub qty_desc: String,
-    pub dest_id: String,
-    pub dest_name: String,
-    pub payment_pence: i64,
-    pub illicit: bool,
-}
+pub const MAX_WEAR: i64 = 10;
+pub const MAX_HEAT: i64 = 10;
+/// Pence a roadside farm extorts for an emergency 8 L when you run dry.
+pub const JERRY_CAN_PENCE: i64 = 360;
+pub const JERRY_CAN_ML: i64 = 8_000;
+pub const DIESEL_BUY_L: i64 = 12;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "stage", rename_all = "snake_case")]
-pub enum RunStage {
-    /// Wychford depot: talk, buy fuel, accept the contract, depart.
-    Town,
+pub enum Stage {
+    /// The depot: meet the fixer, top up fuel, set off.
+    Briefing,
     /// On the road, facing `beats[idx]`.
     Beat { idx: usize },
     /// The aftermath of a beat choice, shown before the road continues.
     Outcome { idx: usize, text: String },
-    /// The destination yard.
+    /// The drop.
     Arrival,
-    /// Ledger Close: what changed, and the door to the next day.
-    Summary { lines: Vec<String> },
+    /// Terminal. `outcome` holds the verdict and the summary lines.
+    Over,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct RunState {
-    pub contract: Contract,
-    pub accepted: bool,
-    pub talked: bool,
-    pub stage: RunStage,
-    /// Storylet ids drawn at depart; the run's hand of cards.
-    pub beats: Vec<String>,
-    /// Run-scoped flags; folded into world flags at Ledger Close.
-    pub flags: BTreeSet<String>,
-    /// Percent multiplier on contract payment at delivery (spoilage, bonuses).
-    pub payment_pct: i64,
-    // Snapshot at departure, for the Ledger Close delta lines.
-    pub start_cash: i64,
-    pub start_fuel_ml: i64,
-    pub start_wear: i64,
-    pub start_suspicion: i64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    InProgress,
+    Won { haul_pence: i64, lines: Vec<String> },
+    Lost { reason: String, lines: Vec<String> },
 }
 
+impl Outcome {
+    pub fn is_over(&self) -> bool {
+        !matches!(self, Outcome::InProgress)
+    }
+}
+
+/// One self-contained smuggling run. Ephemeral: built fresh per session, never
+/// persisted, gone when the tab closes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct WorldState {
+pub struct Mission {
     pub seed: u64,
-    pub tick: Tick,
-    /// Cobb's cash, in pence. Integers only in canon (DR-7). Never negative.
+    // --- the job ---
+    pub terrain: String,
+    pub terrain_name: String,
+    pub terrain_flavor: String,
+    pub cargo: String,
+    pub qty_desc: String,
+    pub dest_name: String,
+    pub illicit: bool,
+    /// The haul on success — the score. Not spending money.
+    pub reward_pence: i64,
+    /// NPC ids: who briefs you, who's hunting you this run.
+    pub fixer: String,
+    pub antagonist: String,
+    // --- clocks ---
+    /// Spending money for fuel and bribes during the run.
     pub cash_pence: i64,
-    /// Bedford TK tank, millilitres.
-    pub fuel_ml: i64,
-    /// Diesel price per litre in Wychford, pence.
     pub diesel_price_pence: i64,
-    /// Clock: 0..=10. The truck's opinion of you.
-    pub bedford_wear: i64,
-    /// Clock: 0..=10. How interested officialdom has become.
-    pub guild_suspicion: i64,
-    /// Faction reputation, -5..=5 each: collective, guild, carver.
-    pub factions: BTreeMap<String, i64>,
-    pub runs_completed: u32,
-    /// Persistent world flags (the facts database, embryonic).
+    pub fuel_ml: i64,
+    pub max_fuel_ml: i64,
+    /// Per-leg burn for this terrain.
+    pub leg_fuel_ml: i64,
+    /// Truck strain. MAX_WEAR = breakdown, mission lost.
+    pub wear: i64,
+    /// Pursuit. MAX_HEAT = caught, mission lost.
+    pub heat: i64,
+    pub dc_mod: i64,
+    pub heat_per_leg: i64,
+    pub wear_per_leg: i64,
+    // --- structure ---
+    pub legs_total: usize,
+    /// Legs driven so far (for the route map).
+    pub leg: usize,
+    pub beats: Vec<String>,
+    pub stage: Stage,
+    pub outcome: Outcome,
     pub flags: BTreeSet<String>,
-    /// NPC memory canon: who knows what, and how they came to know it.
-    pub memories: Vec<MemoryEntry>,
-    /// Canonical facts — the Inquiry's ground truth.
-    pub facts: Vec<FactRec>,
-    pub next_memory_id: u64,
-    /// When Some, the corn exchange has Cobb and the scene routes there.
-    pub inquiry: Option<InquiryState>,
-    /// Carried RNG: replaying the same seed + command log is bit-exact.
+    pub talked: bool,
+    pub cargo_lost: bool,
     pub rng: ChaCha8Rng,
-    pub run: RunState,
 }
 
-impl WorldState {
+impl Mission {
+    /// Roll a fresh mission from a seed. The daemon supplies a wall-clock seed;
+    /// the sim stays pure.
     pub fn new(seed: u64, content: &ContentDb) -> Self {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let contract = engine::gen_contract(&mut rng, content);
-        let factions = avalon_content::FACTIONS
-            .iter()
-            .map(|f| (f.to_string(), 0i64))
-            .collect();
-        Self {
-            seed,
-            tick: 0,
-            cash_pence: 12_000, // £50: one tank of diesel and a bad reputation
-            fuel_ml: 18_000,
-            diesel_price_pence: 18,
-            bedford_wear: 2,
-            guild_suspicion: 0,
-            factions,
-            runs_completed: 0,
-            flags: BTreeSet::new(),
-            memories: Vec::new(),
-            facts: Vec::new(),
-            next_memory_id: 1,
-            inquiry: None,
-            rng,
-            run: RunState {
-                contract,
-                accepted: false,
-                talked: false,
-                stage: RunStage::Town,
-                beats: Vec::new(),
-                flags: BTreeSet::new(),
-                payment_pct: 100,
-                start_cash: 12_000,
-                start_fuel_ml: 18_000,
-                start_wear: 2,
-                start_suspicion: 0,
-            },
+        engine::generate(seed, content)
+    }
+
+    pub fn fuel_l(&self) -> i64 {
+        self.fuel_ml / 1_000
+    }
+
+    pub fn fuel_pct(&self) -> i64 {
+        if self.max_fuel_ml <= 0 {
+            0
+        } else {
+            (self.fuel_ml * 100 / self.max_fuel_ml).clamp(0, 100)
         }
-    }
-
-    pub fn day(&self) -> u64 {
-        self.tick / PHASES_PER_DAY
-    }
-
-    pub fn phase_name(&self) -> &'static str {
-        PHASE_NAMES[(self.tick % PHASES_PER_DAY) as usize]
-    }
-
-    pub fn faction(&self, id: &str) -> i64 {
-        self.factions.get(id).copied().unwrap_or(0)
     }
 }
 
@@ -175,37 +142,12 @@ impl WorldState {
 pub enum Command {
     /// Take choice `idx` of the current scene. Disabled/out-of-range = no-op.
     Choose { idx: usize },
-    /// Offline catch-up: `days` real days passed while nobody was driving.
-    CatchUp { days: u64 },
-    /// Recorded oracle (daemon-issued, post-validation): an NPC's reflection.
-    AddReflection { npc: String, text: String, importance: i64 },
-    /// Recorded oracle: cosmetic rewording of an existing memory's text.
-    RewriteMemory { memory_id: u64, text: String },
-    /// Recorded oracle: residue of a town conversation with an NPC.
-    RecordChat { npc: String, summary: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
-    Narration {
-        tick: Tick,
-        text: String,
-    },
-    PriceDrift {
-        tick: Tick,
-        good: String,
-        settlement: String,
-        price_pence: i64,
-    },
-    /// A canonical, attributable happening — the Inquiry's ground truth.
-    Fact {
-        tick: Tick,
-        fact_id: String,
-        actor: String,
-        action: String,
-        location: String,
-    },
+    Narration { text: String },
 }
 
 /// What the player sees. Pure function of state + content; never touches RNG.
@@ -214,6 +156,8 @@ pub struct Scene {
     pub title: String,
     pub body: Vec<String>,
     pub choices: Vec<Choice>,
+    /// NPC id whose portrait fronts this scene, if any (UI hint).
+    pub speaker: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -232,67 +176,21 @@ impl Choice {
     }
 }
 
-pub fn scene(state: &WorldState, content: &ContentDb) -> Scene {
-    if state.inquiry.is_some() {
-        inquiry::scene(state, content)
-    } else {
-        engine::scene(state, content)
-    }
+pub fn scene(m: &Mission, content: &ContentDb) -> Scene {
+    engine::scene(m, content)
 }
 
-/// The single pure transition. Everything canonical happens here.
-pub fn step(state: &WorldState, cmd: &Command, content: &ContentDb) -> (WorldState, Vec<Event>) {
-    let mut next = state.clone();
+/// The single pure transition.
+pub fn step(m: &Mission, cmd: &Command, content: &ContentDb) -> (Mission, Vec<Event>) {
+    let mut next = m.clone();
     let mut events = Vec::new();
     match cmd {
         Command::Choose { idx } => {
-            let current = scene(state, content);
+            let current = scene(m, content);
             let valid = current.choices.get(*idx).map(|c| c.enabled).unwrap_or(false);
-            if valid {
-                if next.inquiry.is_some() {
-                    inquiry::choose(&mut next, *idx, content, &mut events);
-                } else {
-                    engine::choose(&mut next, *idx, content, &mut events);
-                }
+            if valid && !m.outcome.is_over() {
+                engine::choose(&mut next, *idx, content, &mut events);
             }
-        }
-        Command::CatchUp { days } => engine::catch_up(&mut next, *days, &mut events),
-        Command::AddReflection { npc, text, importance } => {
-            let tick = next.tick;
-            memory::add_memory(
-                &mut next,
-                MemoryEntry {
-                    id: 0,
-                    npc: npc.clone(),
-                    kind: "reflection".into(),
-                    text: text.clone(),
-                    fact_id: None,
-                    asserts: None,
-                    importance: (*importance).clamp(1, 10),
-                    tick,
-                },
-            );
-        }
-        Command::RewriteMemory { memory_id, text } => {
-            if let Some(m) = next.memories.iter_mut().find(|m| m.id == *memory_id) {
-                m.text = text.clone();
-            }
-        }
-        Command::RecordChat { npc, summary } => {
-            let tick = next.tick;
-            memory::add_memory(
-                &mut next,
-                MemoryEntry {
-                    id: 0,
-                    npc: npc.clone(),
-                    kind: "chat".into(),
-                    text: summary.clone(),
-                    fact_id: None,
-                    asserts: None,
-                    importance: 2,
-                    tick,
-                },
-            );
         }
     }
     (next, events)
@@ -302,9 +200,9 @@ pub(crate) fn storylet<'c>(content: &'c ContentDb, id: &str) -> Option<&'c Story
     content.storylets.iter().find(|s| s.id == id)
 }
 
-/// Stable hash of the full world state, for golden-replay tests.
-pub fn world_hash(state: &WorldState) -> u64 {
-    let json = serde_json::to_string(state).expect("WorldState is always serializable");
+/// Stable hash of the full state, for golden-replay tests.
+pub fn mission_hash(m: &Mission) -> u64 {
+    let json = serde_json::to_string(m).expect("Mission is always serializable");
     let mut h = DefaultHasher::new();
     json.hash(&mut h);
     h.finish()
@@ -324,11 +222,11 @@ pub fn fmt_pence(p: i64) -> String {
     }
 }
 
-pub(crate) fn narrate(w: &WorldState, events: &mut Vec<Event>, text: impl Into<String>) {
-    events.push(Event::Narration { tick: w.tick, text: text.into() });
+pub(crate) fn narrate(events: &mut Vec<Event>, text: impl Into<String>) {
+    events.push(Event::Narration { text: text.into() });
 }
 
-/// d12 + skill, the only dice in the game.
+/// d12 + skill.
 pub(crate) fn roll(rng: &mut ChaCha8Rng, skill: i64) -> i64 {
     rng.gen_range(1..=12) + skill
 }
@@ -343,233 +241,133 @@ mod tests {
         avalon_content::load(&dir).expect("content loads and validates")
     }
 
-    /// Drive one complete Run with a fixed policy: accept, fuel up, depart,
-    /// then always take the first enabled choice until back in Town.
-    fn scripted_run(w: WorldState, c: &ContentDb) -> WorldState {
-        let mut w = w;
-        for idx in [2usize, 1, 3] {
-            let (next, _) = step(&w, &Command::Choose { idx }, c);
-            w = next;
-        }
+    /// A "sensible but not optimal" policy: top up fuel once, set off, then on
+    /// the road prefer the lowest-risk option — never smash a gate, never run
+    /// an ambush, take inspections over bluffs. This is the baseline the ~60%
+    /// loss target is measured against.
+    fn sensible_play(seed: u64, c: &ContentDb) -> Outcome {
+        let mut m = Mission::new(seed, c);
         let mut guard = 0;
-        while !matches!(w.run.stage, RunStage::Town) {
-            let s = scene(&w, c);
-            let idx = s
-                .choices
-                .iter()
-                .position(|ch| ch.enabled)
-                .expect("every scene must have an enabled choice");
-            let (next, _) = step(&w, &Command::Choose { idx }, c);
-            w = next;
+        loop {
+            if m.outcome.is_over() {
+                return m.outcome;
+            }
+            let s = scene(&m, c);
+            let idx = pick(&m, &s);
+            let (next, _) = step(&m, &Command::Choose { idx }, c);
+            m = next;
             guard += 1;
-            assert!(guard < 200, "run did not terminate");
+            assert!(guard < 200, "mission did not terminate (seed {seed})");
         }
-        w
+    }
+
+    fn pick(m: &Mission, s: &Scene) -> usize {
+        let enabled: Vec<usize> =
+            (0..s.choices.len()).filter(|&i| s.choices[i].enabled).collect();
+        match &m.stage {
+            Stage::Briefing => {
+                // top up fuel if affordable and low, else set off (last choice).
+                if m.fuel_pct() < 80 && s.choices.get(1).map(|c| c.enabled).unwrap_or(false) {
+                    1
+                } else {
+                    *enabled.last().unwrap()
+                }
+            }
+            // On the road / outcome / arrival: take the FIRST enabled choice —
+            // authored so choice 0 is the cautious, lawful option.
+            _ => enabled[0],
+        }
     }
 
     #[test]
     fn content_loads_and_validates() {
         let c = content();
-        assert!(c.storylets.len() >= 8, "deck too thin: {}", c.storylets.len());
-        assert!(c.settlements.len() >= 4);
+        assert!(c.terrains.len() >= 4);
+        assert!(c.storylets.len() >= 8);
         assert!(c.npcs.len() >= 5);
     }
 
     #[test]
-    fn golden_replay_full_run_is_bit_exact() {
+    fn golden_replay_is_bit_exact() {
         let c = content();
-        let a = scripted_run(WorldState::new(0xC0BB, &c), &c);
-        let b = scripted_run(WorldState::new(0xC0BB, &c), &c);
-        assert_eq!(world_hash(&a), world_hash(&b));
+        let a = sensible_play(0xC0BB, &c);
+        let b = sensible_play(0xC0BB, &c);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn different_seeds_diverge() {
+    fn missions_vary_by_seed() {
         let c = content();
-        let a = scripted_run(WorldState::new(1, &c), &c);
-        let b = scripted_run(WorldState::new(2, &c), &c);
-        assert_ne!(world_hash(&a), world_hash(&b));
-    }
-
-    #[test]
-    fn a_run_completes_and_pays() {
-        let c = content();
-        let w = scripted_run(WorldState::new(0xC0BB, &c), &c);
-        assert_eq!(w.runs_completed, 1);
-        assert!(w.cash_pence > 0);
-        assert!(!w.run.accepted, "new day offers a fresh contract");
-        assert_eq!(w.tick % PHASES_PER_DAY, 0, "ledger close lands on a dawn");
-    }
-
-    #[test]
-    fn runs_vary_by_seed_and_dest() {
-        let c = content();
-        let mut beat_sets = BTreeSet::new();
-        for seed in 0..12u64 {
-            let mut w = WorldState::new(seed, &c);
-            for idx in [2usize, 1, 3] {
-                let (next, _) = step(&w, &Command::Choose { idx }, &c);
-                w = next;
-            }
-            beat_sets.insert(w.run.beats.clone());
+        let mut terrains = BTreeSet::new();
+        let mut cargoes = BTreeSet::new();
+        for seed in 0..24u64 {
+            let m = Mission::new(seed, &c);
+            terrains.insert(m.terrain.clone());
+            cargoes.insert(m.cargo.clone());
         }
-        assert!(beat_sets.len() >= 4, "deck draws too samey: {beat_sets:?}");
+        assert!(terrains.len() >= 3, "terrains too samey: {terrains:?}");
+        assert!(cargoes.len() >= 3, "cargoes too samey: {cargoes:?}");
     }
 
     #[test]
-    fn save_load_roundtrip_preserves_replay() {
+    fn every_mission_terminates_and_is_decisive() {
         let c = content();
-        let mut w = WorldState::new(0xC0BB, &c);
-        for idx in [2usize, 1, 3, 0] {
-            let (next, _) = step(&w, &Command::Choose { idx }, &c);
-            w = next;
-        }
-        let json = serde_json::to_string(&w).unwrap();
-        let restored: WorldState = serde_json::from_str(&json).unwrap();
-        let (a, _) = step(&w, &Command::Choose { idx: 0 }, &c);
-        let (b, _) = step(&restored, &Command::Choose { idx: 0 }, &c);
-        assert_eq!(world_hash(&a), world_hash(&b));
-    }
-
-    #[test]
-    fn invariants_hold_over_many_runs_and_catchups() {
-        let c = content();
-        let mut w = WorldState::new(42, &c);
-        for _ in 0..25 {
-            w = scripted_run(w, &c);
-            let (next, _) = step(&w, &Command::CatchUp { days: 3 }, &c);
-            w = next;
-        }
-        assert!((8..=48).contains(&w.diesel_price_pence));
-        assert!(w.cash_pence >= 0, "cash went negative: {}", w.cash_pence);
-        assert!((0..=10).contains(&w.bedford_wear));
-        assert!((0..=10).contains(&w.guild_suspicion));
-        for v in w.factions.values() {
-            assert!((-5..=5).contains(v));
-        }
-        assert_eq!(w.runs_completed, 25);
-    }
-
-    /// Smash gates until officialdom convenes, then survive the Inquiry.
-    #[test]
-    fn an_inquiry_convenes_and_resolves() {
-        let c = content();
-        let mut w = WorldState::new(0xC0BB, &c);
-        let mut guard = 0;
-        // Policy: always pick the LAST enabled choice on the road (the
-        // troublemaker's option: through the pole, bodge it, drive past).
-        while w.inquiry.is_none() {
-            let s = scene(&w, &c);
-            let idx = if matches!(w.run.stage, RunStage::Town) && w.inquiry.is_none() {
-                if !w.run.accepted {
-                    2
-                } else if w.fuel_ml < 10_000 {
-                    1
-                } else {
-                    3
-                }
-            } else {
-                s.choices.iter().rposition(|ch| ch.enabled).unwrap()
-            };
-            let (next, _) = step(&w, &Command::Choose { idx }, &c);
-            w = next;
-            guard += 1;
-            assert!(guard < 600, "no inquiry after {guard} choices (susp {})", w.guild_suspicion);
-        }
-        assert!(!w.memories.is_empty(), "inquiry without memories");
-        assert!(!w.facts.is_empty(), "inquiry without facts");
-
-        // Question everyone, challenge everything, then take the verdict.
-        let mut steps = 0;
-        while w.inquiry.is_some() {
-            let s = scene(&w, &c);
-            let idx = s.choices.iter().position(|ch| ch.enabled).unwrap();
-            let (next, _) = step(&w, &Command::Choose { idx }, &c);
-            w = next;
-            steps += 1;
-            assert!(steps < 60, "inquiry did not resolve");
-        }
-        assert!(matches!(w.run.stage, RunStage::Town), "back to the depot after");
-    }
-
-    #[test]
-    fn oracle_commands_are_recorded_and_replayable() {
-        let c = content();
-        let w = WorldState::new(5, &c);
-        let cmd = Command::AddReflection {
-            npc: "arthur".into(),
-            text: "Cobb is late the way rain is wet.".into(),
-            importance: 7,
-        };
-        let (a, _) = step(&w, &cmd, &c);
-        let (b, _) = step(&w, &cmd, &c);
-        assert_eq!(world_hash(&a), world_hash(&b));
-        assert_eq!(a.memories.len(), 1);
-        let rewrite = Command::RewriteMemory {
-            memory_id: a.memories[0].id,
-            text: "Cobb's lateness is a force of nature.".into(),
-        };
-        let (a2, _) = step(&a, &rewrite, &c);
-        assert_eq!(a2.memories[0].text, "Cobb's lateness is a force of nature.");
-    }
-
-    #[test]
-    fn gossip_distortion_is_catchable() {
-        let c = content();
-        // Across seeds: at least one gossip memory whose asserts differ from
-        // the canonical fact — the contradiction the Inquiry exists to catch.
-        let mut found = false;
-        for seed in 0..30u64 {
-            let mut w = WorldState::new(seed, &c);
-            for _ in 0..6 {
-                w = {
-                    let mut w = w;
-                    for idx in [2usize, 1, 3] {
-                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
-                        w = next;
-                    }
-                    let mut guard = 0;
-                    while !matches!(w.run.stage, RunStage::Town) && w.inquiry.is_none() {
-                        let s = scene(&w, &c);
-                        let idx = s.choices.iter().rposition(|ch| ch.enabled).unwrap();
-                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
-                        w = next;
-                        guard += 1;
-                        if guard > 100 {
-                            break;
-                        }
-                    }
-                    while w.inquiry.is_some() {
-                        let s = scene(&w, &c);
-                        let idx = s.choices.iter().position(|ch| ch.enabled).unwrap();
-                        let (next, _) = step(&w, &Command::Choose { idx }, &c);
-                        w = next;
-                    }
-                    w
-                };
-            }
-            for m in w.memories.iter().filter(|m| m.kind == "gossip") {
-                let Some(fid) = &m.fact_id else { continue };
-                let Some(f) = w.facts.iter().find(|f| &f.fact_id == fid) else { continue };
-                if m.asserts.as_ref() != Some(&f.attrs) {
-                    found = true;
-                }
-            }
-            if found {
-                break;
+        for seed in 0..200u64 {
+            match sensible_play(seed, &c) {
+                Outcome::Won { haul_pence, .. } => assert!(haul_pence > 0),
+                Outcome::Lost { reason, .. } => assert!(!reason.is_empty()),
+                Outcome::InProgress => panic!("seed {seed} ended InProgress"),
             }
         }
-        assert!(found, "no distorted gossip in 30 seeds — distortion broken");
+    }
+
+    /// The headline balance gate: sensible play should lose roughly 60% of the
+    /// time — hard but earned. Band kept wide enough to survive content tweaks.
+    #[test]
+    fn loss_rate_is_about_sixty_percent() {
+        let c = content();
+        let n = 600u64;
+        let losses = (0..n)
+            .filter(|&seed| matches!(sensible_play(seed, &c), Outcome::Lost { .. }))
+            .count();
+        let pct = losses * 100 / n as usize;
+        assert!(
+            (45..=72).contains(&pct),
+            "loss rate {pct}% outside the 45–72% target band ({losses}/{n})"
+        );
+    }
+
+    #[test]
+    fn invariants_hold() {
+        let c = content();
+        for seed in 0..200u64 {
+            let mut m = Mission::new(seed, &c);
+            let mut guard = 0;
+            while !m.outcome.is_over() {
+                assert!((0..=MAX_WEAR).contains(&m.wear));
+                assert!((0..=MAX_HEAT).contains(&m.heat));
+                assert!(m.cash_pence >= 0);
+                assert!(m.fuel_ml >= 0);
+                let s = scene(&m, &c);
+                let idx = (0..s.choices.len()).find(|&i| s.choices[i].enabled).unwrap();
+                let (next, _) = step(&m, &Command::Choose { idx }, &c);
+                m = next;
+                guard += 1;
+                assert!(guard < 200);
+            }
+        }
     }
 
     #[test]
     fn disabled_and_out_of_range_choices_are_noops() {
         let c = content();
-        let w = WorldState::new(7, &c);
-        let (after, ev) = step(&w, &Command::Choose { idx: 3 }, &c); // depart before accepting
-        assert_eq!(world_hash(&w), world_hash(&after));
+        let m = Mission::new(7, &c);
+        let before = mission_hash(&m);
+        // Briefing choice 0 is "talk" (enabled); pick a wild index.
+        let (after, ev) = step(&m, &Command::Choose { idx: 99 }, &c);
+        assert_eq!(before, mission_hash(&after));
         assert!(ev.is_empty());
-        let (after, _) = step(&w, &Command::Choose { idx: 99 }, &c);
-        assert_eq!(world_hash(&w), world_hash(&after));
     }
 }
+
+
