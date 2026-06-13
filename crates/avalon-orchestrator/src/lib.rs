@@ -23,6 +23,10 @@ pub struct LlmConfig {
     pub host: String,
     pub model: String,
     pub embed_model: String,
+    /// Off when sharing a single-model Ollama (e.g. Thrushcombe's container):
+    /// an embed call would evict the dialogue model. Retrieval then degrades
+    /// to recency+importance, which is fine. Set AVALON_EMBED=0 to disable.
+    pub embed_enabled: bool,
     /// Sentence cap for dialogue lines.
     pub max_sentences: usize,
     pub banned_phrases: Vec<String>,
@@ -35,6 +39,7 @@ impl Default for LlmConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:11436".into()),
             model: std::env::var("AVALON_MODEL").unwrap_or_else(|_| "qwen3:8b".into()),
             embed_model: "nomic-embed-text".into(),
+            embed_enabled: std::env::var("AVALON_EMBED").map(|v| v != "0").unwrap_or(true),
             max_sentences: 3,
             banned_phrases: Vec::new(),
         }
@@ -181,6 +186,9 @@ impl Orchestrator {
     /// Embedding for memory retrieval. None when the embedder is missing —
     /// retrieval degrades to recency+importance, which is fine.
     pub async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        if !self.cfg.embed_enabled {
+            return None;
+        }
         let url = format!("{}/api/embeddings", self.cfg.host);
         let body = json!({ "model": self.cfg.embed_model, "prompt": text });
         let resp: Value = self

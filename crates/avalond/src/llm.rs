@@ -248,6 +248,9 @@ pub async fn idle_worker(app: Arc<App>) {
 async fn run_job(app: &Arc<App>, kind: &str, p: &Value) -> bool {
     match kind {
         "embed" => {
+            if !app.orch.cfg.embed_enabled {
+                return true; // embeddings off (shared single-model Ollama): no-op
+            }
             let (Some(mid), Some(text)) = (p["memory_id"].as_u64(), p["text"].as_str()) else {
                 return true; // malformed: drop
             };

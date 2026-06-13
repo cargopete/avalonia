@@ -1,11 +1,16 @@
-# Avalon — local Qwen oracle, capped & sandboxed. Pattern proven in
-# ~/townsfolk/llm: pinned image, read-only reuse of the native model store,
-# hard resource caps. Avalon gets its OWN container (port 11436) so its
-# tuning never fights Thrushcombe's (11435) or the native Ollama (11434).
+# Avalon — OPTIONAL dedicated Qwen oracle. By default Avalon shares
+# Thrushcombe's container on :11435 (set AVALON_OLLAMA=http://127.0.0.1:11435,
+# AVALON_EMBED=0) — one qwen3:8b on the 8 GB card serves both. Bring THIS up
+# only if you want Avalon on its own container (then point AVALON_OLLAMA back
+# at :11436); note two copies of qwen3:8b will NOT both fit in 8 GB VRAM.
 #
-#   docker compose up -d
-#   docker compose logs -f
-#   docker compose down
+# `name:` is mandatory: this dir AND ~/townsfolk/llm both basename "llm", so
+# without an explicit project name `docker compose down` here would also tear
+# down thrushcombe-qwen (learned the hard way).
+#
+#   docker compose up -d  /  logs -f  /  down
+
+name: avalon-llm
 
 services:
   qwen:
