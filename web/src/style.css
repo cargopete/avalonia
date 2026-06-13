@@ -26,6 +26,14 @@ body {
 
 .boot { padding: 4rem; text-align: center; color: var(--dim); }
 
+.sound-toggle {
+  position: fixed; top: 0.7rem; right: 0.8rem; z-index: 50;
+  background: rgba(28,26,20,0.7); border: 1px solid #3a3424; border-radius: 4px;
+  color: var(--ink); font-size: 1rem; line-height: 1; padding: 0.35rem 0.5rem;
+  cursor: pointer;
+}
+.sound-toggle:hover { border-color: var(--accent); }
+
 /* ---------------- start screen ---------------- */
 .start { min-height: 100vh; display: grid; place-items: center; padding: 2rem; }
 .start-card {

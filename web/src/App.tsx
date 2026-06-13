@@ -1,5 +1,6 @@
-import { createSignal, onCleanup, onMount, For, Show } from 'solid-js'
+import { createSignal, createEffect, onCleanup, onMount, For, Show } from 'solid-js'
 import { Backdrop, Portrait } from './art'
+import { audio, tensionFromState } from './audio'
 
 // Thin client (RFC-AVL-001 R1): render state, post intents. No game rules here.
 
@@ -64,14 +65,40 @@ export default function App() {
   const [chat, setChat] = createSignal<string[]>([])
   const [chatBusy, setChatBusy] = createSignal(false)
   const [llm, setLlm] = createSignal<boolean | null>(null)
+  const [muted, setMuted] = createSignal(localStorage.getItem('avalon-muted') === '1')
   let busy = false
   let chatInput: HTMLInputElement | undefined
 
   const m = () => view()?.mission ?? null
 
+  const toggleSound = () => {
+    audio.ensure() // gesture: allowed to start audio
+    const next = !muted()
+    setMuted(next)
+    audio.setMuted(next)
+    localStorage.setItem('avalon-muted', next ? '1' : '0')
+  }
+
+  // Drive the adaptive score from game state; sting once on a decisive end.
+  let prevOutcome = 'none'
+  createEffect(() => {
+    const mm = m()
+    if (!mm) {
+      audio.setTension(0)
+      prevOutcome = 'none'
+      return
+    }
+    audio.setTension(tensionFromState(mm.heat, mm.wear, mm.outcome))
+    if (mm.outcome !== prevOutcome && (mm.outcome === 'won' || mm.outcome === 'lost')) {
+      audio.sting(mm.outcome)
+    }
+    prevOutcome = mm.outcome
+  })
+
   const refresh = async () => setView(await (await fetch('/api/view')).json())
 
   const newRun = async () => {
+    if (!muted()) audio.ensure() // gesture
     setChat([])
     setView(await (await fetch('/api/new', { method: 'POST' })).json())
   }
@@ -148,8 +175,12 @@ export default function App() {
   return (
     <Show when={view()} fallback={<div class="boot">Reaching the depot…</div>}>
       {(v) => (
-        <Show when={v().active && m()} fallback={<StartScreen scores={v().scores} llm={llm()} onStart={newRun} />}>
-          <GameScreen
+        <>
+          <button class="sound-toggle" onClick={toggleSound} title="sound on/off">
+            {muted() ? '🔇' : '🔊'}
+          </button>
+          <Show when={v().active && m()} fallback={<StartScreen scores={v().scores} llm={llm()} onStart={newRun} />}>
+            <GameScreen
             m={m()!}
             chat={chat()}
             chatBusy={chatBusy()}
@@ -159,7 +190,8 @@ export default function App() {
             newRun={newRun}
             abandon={abandon}
           />
-        </Show>
+          </Show>
+        </>
       )}
     </Show>
   )
