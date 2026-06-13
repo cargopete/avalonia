@@ -21,6 +21,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 fn bind_addr() -> String {
     std::env::var("AVALON_BIND").unwrap_or_else(|_| "127.0.0.1:4747".into())
@@ -357,6 +358,12 @@ async fn main() {
         .route("/api/status", get(status))
         .route("/api/stream", get(stream))
         .fallback_service(static_svc)
+        // Always revalidate: index.html is tiny and hashed assets carry their
+        // own bust, so no-cache keeps deploys instant without stale HTML.
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        ))
         .layer(axum::middleware::from_fn(auth_gate))
         .with_state(app);
 
