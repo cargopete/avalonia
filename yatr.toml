@@ -1,0 +1,79 @@
+# yatr - https://github.com/cargopete/yatr
+
+[toolchain.node]
+version = "26.11.1"
+url = "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.gz"
+bin = "node-v{version}-{os}-{arch}/bin"
+
+[env]
+CARGO_TERM_COLOR = "always"
+
+[settings]
+cache = true
+
+[tasks.fmt]
+desc = "Format the Rust tree"
+run = ["cargo fmt --all"]
+no_cache = true
+
+[tasks.fmt-check]
+desc = "Fail if the Rust tree is unformatted"
+run = ["cargo fmt --all --check"]
+sources = ["crates/**/*.rs"]
+
+[tasks.lint]
+desc = "Clippy with warnings denied"
+run = ["cargo clippy --workspace --all-targets -- -D warnings"]
+sources = ["crates/**", "Cargo.toml", "Cargo.lock"]
+
+# avalon-sim's tests load and validate content/.
+[tasks.test]
+desc = "The test suite, including the content validation"
+run = ["cargo test --workspace"]
+sources = ["crates/**", "content/**", "Cargo.toml", "Cargo.lock"]
+watch = ["crates/**", "content/**"]
+
+[tasks.llm-up]
+desc = "Start the optional Qwen container on :11436 (needs an NVIDIA GPU)"
+cwd = "llm"
+run = ["docker compose up -d"]
+no_cache = true
+
+[tasks.daemon]
+desc = "avalond on :4747, saving to saves/dev.db"
+foreground = true
+run = ["cargo run -p avalond"]
+
+# Not cached: node_modules is gitignored, so yatr cannot see whether it exists.
+[tasks.web-install]
+desc = "Install the SPA's dependencies from the lockfile"
+cwd = "web"
+run = ["npm ci --no-audit --no-fund"]
+no_cache = true
+
+[tasks.web-typecheck]
+desc = "Type-check the SPA"
+depends = ["web-install"]
+cwd = "web"
+run = ["npx tsc --noEmit"]
+sources = ["src/**", "tsconfig.json", "package-lock.json"]
+
+[tasks.web-build]
+desc = "Production build of the SPA into web/dist"
+depends = ["web-install"]
+cwd = "web"
+run = ["npx vite build"]
+sources = ["src/**", "index.html", "vite.config.ts", "tsconfig.json", "package-lock.json"]
+outputs = ["dist/**"]
+
+[tasks.web-dev]
+desc = "Vite dev server on :5173, proxying /api to the daemon"
+depends = ["web-install"]
+cwd = "web"
+foreground = true
+run = ["npx vite"]
+
+[tasks.ci]
+desc = "fmt-check, lint, test, web-typecheck, web-build"
+depends = ["fmt-check", "lint", "test", "web-typecheck", "web-build"]
+run = []
